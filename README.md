@@ -66,7 +66,6 @@ nella strategia originale.
 ### Top 10 titoli
 - NVDA
 - GOOGL
-- GOOG
 - AAPL
 - MSFT
 - AMZN
@@ -91,3 +90,23 @@ nella strategia originale.
 DAX ed Euro Stoxx 50 vengono volutamente analizzati tramite il cash index:
 i continuous futures Eurex disponibili gratuitamente via Yahoo non sono
 sufficientemente affidabili/coerenti per costruire una stagionalità 20Y.
+
+
+## Forza del movimento
+
+La V1.4 aggiunge un controllo della dimensione economica/statistica del movimento:
+
+- ATR periodi default = 5
+- ATR calcolato solo sulle sedute completate prima della giornata target
+- ATR% = ATR / ultimo close
+- Target/ATR = target stagionale % / ATR%
+- classificazione:
+  - < 0,30 = DEBOLE
+  - 0,30–0,50 = MEDIO
+  - 0,50–0,75 = BUONO
+  - >= 0,75 = FORTE
+
+La classificazione NON filtra ancora i segnali. Serve per raccogliere evidenza
+e capire successivamente se una soglia minima migliora davvero i risultati.
+
+Alphabet viene mantenuta una sola volta tramite GOOGL.

@@ -16,7 +16,6 @@ DEFAULT_UNIVERSE = {
     # Top 10 mostrati nella classifica fornita
     "Nvidia": "NVDA",
     "Alphabet A": "GOOGL",
-    "Alphabet C": "GOOG",
     "Apple": "AAPL",
     "Microsoft": "MSFT",
     "Amazon": "AMZN",
@@ -204,6 +203,47 @@ def stats_for_window(sample: pd.DataFrame, expected_n: int) -> dict:
     }
 
 
+def atr_pct_before_date(df: pd.DataFrame, target_date: date, period: int) -> tuple[float, float]:
+    """
+    ATR semplice sulle ultime N sedute COMPLETATE prima della data target.
+    Restituisce (ATR in prezzo, ATR in % del close più recente).
+    Nessun look-ahead: la seduta target non viene mai utilizzata.
+    """
+    hist = df.loc[df.index < pd.Timestamp(target_date)].copy()
+    if len(hist) < period + 1:
+        return np.nan, np.nan
+
+    prev_close = hist["Close"].shift(1)
+    tr = pd.concat(
+        [
+            hist["High"] - hist["Low"],
+            (hist["High"] - prev_close).abs(),
+            (hist["Low"] - prev_close).abs(),
+        ],
+        axis=1,
+    ).max(axis=1)
+
+    atr = tr.rolling(period).mean().iloc[-1]
+    last_close = hist["Close"].iloc[-1]
+
+    if pd.isna(atr) or pd.isna(last_close) or last_close == 0:
+        return np.nan, np.nan
+
+    return float(atr), float(atr / last_close)
+
+
+def movement_class(ratio: float) -> str:
+    if pd.isna(ratio):
+        return "n/d"
+    if ratio < 0.30:
+        return "DEBOLE"
+    if ratio < 0.50:
+        return "MEDIO"
+    if ratio < 0.75:
+        return "BUONO"
+    return "FORTE"
+
+
 def analyze_target(
     name: str,
     ticker: str,
@@ -211,6 +251,7 @@ def analyze_target(
     target: pd.Series,
     threshold: float,
     schedule: pd.DataFrame,
+    atr_period: int,
 ) -> dict:
     stats = {}
     samples = {}
@@ -259,6 +300,14 @@ def analyze_target(
         original_target = np.nan
         original_stop = np.nan
 
+    atr_value, atr_pct = atr_pct_before_date(df, target["date"], atr_period)
+    target_atr = (
+        original_target / atr_pct
+        if not pd.isna(original_target) and not pd.isna(atr_pct) and atr_pct > 0
+        else np.nan
+    )
+    move_quality = movement_class(target_atr)
+
     # Punteggio solo per ordinare le opportunità; NON modifica il filtro.
     directional_probs = []
     if bias == "LONG":
@@ -283,6 +332,9 @@ def analyze_target(
         "Median 15Y": stats[15]["median"],
         "Target orig.": original_target,
         "Stop orig.": original_stop,
+        "ATR%": atr_pct,
+        "Target/ATR": target_atr,
+        "Forza mov.": move_quality,
         "Score": score,
         "N10": stats[10]["n"],
         "N15": stats[15]["n"],
@@ -322,6 +374,16 @@ with st.sidebar:
         step=1,
     )
     threshold = threshold_pct / 100
+
+    atr_period = st.number_input(
+        "ATR periodi per forza movimento",
+        min_value=2,
+        max_value=50,
+        value=5,
+        step=1,
+        help="Default 5: più coerente con una strategia su singola seduta. "
+             "Serve solo per valutare la dimensione del target rispetto alla volatilità recente."
+    )
 
     st.divider()
     st.subheader("Universo")
@@ -403,6 +465,7 @@ for i, (name, ticker) in enumerate(universe.items(), start=1):
                 target=target,
                 threshold=threshold,
                 schedule=schedule,
+                atr_period=int(atr_period),
             )
         )
 
@@ -437,12 +500,16 @@ else:
             "Date", "Asset", "Ticker", "Bias",
             "10Y", "15Y", "20Y",
             "Avg 10Y", "Avg 15Y", "Avg 20Y", "Mediana 3 rend.",
-            "Median 15Y", "Target orig.", "Stop orig.", "Score"
+            "Median 15Y", "Target orig.", "Stop orig.",
+            "ATR%", "Target/ATR", "Forza mov.", "Score"
         ]
     ].copy()
 
-    for col in ["10Y", "15Y", "20Y", "Avg 10Y", "Avg 15Y", "Avg 20Y", "Mediana 3 rend.", "Median 15Y", "Target orig.", "Stop orig.", "Score"]:
+    for col in ["10Y", "15Y", "20Y", "Avg 10Y", "Avg 15Y", "Avg 20Y", "Mediana 3 rend.", "Median 15Y", "Target orig.", "Stop orig.", "ATR%", "Score"]:
         display[col] = display[col].map(pct)
+    display["Target/ATR"] = display["Target/ATR"].map(
+        lambda x: "n/d" if pd.isna(x) else f"{x:.2f}"
+    )
 
     def color_bias(val):
         if val == "SHORT":
@@ -451,7 +518,20 @@ else:
             return "color: #21c55d; font-weight: 700;"
         return ""
 
-    styled_display = display.style.map(color_bias, subset=["Bias"])
+    def color_strength(val):
+        styles = {
+            "DEBOLE": "color: #ff4b4b; font-weight: 700;",
+            "MEDIO": "color: #f0a000; font-weight: 700;",
+            "BUONO": "color: #21c55d; font-weight: 700;",
+            "FORTE": "color: #21c55d; font-weight: 800;",
+        }
+        return styles.get(val, "")
+
+    styled_display = (
+        display.style
+        .map(color_bias, subset=["Bias"])
+        .map(color_strength, subset=["Forza mov."])
+    )
     st.dataframe(styled_display, width="stretch", hide_index=True)
 
 st.divider()
@@ -488,9 +568,13 @@ if valid_keys:
         f"**Avg 20Y:** {pct(original['Avg 20Y'])}  ·  "
         f"**Mediana dei 3 rendimenti:** {pct(original['Mediana 3 rend.'])}"
     )
+    target_atr_txt = "n/d" if pd.isna(original["Target/ATR"]) else f"{original['Target/ATR']:.2f}"
     st.write(
         f"**TP originale:** {pct(original['Target orig.'])}  ·  "
-        f"**SL originale:** {pct(original['Stop orig.'])}"
+        f"**SL originale:** {pct(original['Stop orig.'])}  ·  "
+        f"**ATR{int(atr_period)}:** {pct(original['ATR%'])}  ·  "
+        f"**Target/ATR:** {target_atr_txt}  ·  "
+        f"**Forza movimento:** {original['Forza mov.']}"
     )
 
     hist = original["_samples"][20].copy()
@@ -515,6 +599,13 @@ with st.expander("Diagnostica dati / campione"):
         st.warning("\n".join(data_errors))
 
 st.divider()
+st.info(
+    "**Forza movimento:** Target/ATR confronta il target stagionale con la volatilità "
+    f"recente ATR{int(atr_period)}. <0,30 = DEBOLE · 0,30–0,50 = MEDIO · "
+    "0,50–0,75 = BUONO · ≥0,75 = FORTE. Per ora è solo una classificazione: "
+    "non elimina automaticamente nessun segnale."
+)
+
 st.caption(
     "Uso di ricerca/statistica, non consiglio finanziario. "
     "La disponibilità e qualità dei dati Yahoo Finance va controllata "
