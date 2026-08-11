@@ -157,3 +157,33 @@ Per azioni sono unità di prezzo (es. dollari per azione).
 - la Diagnostica mostra sempre le probabilità LONG e SHORT reali su 10Y/15Y/20Y
 - `Bias = —` significa "nessun segnale valido"
 - `N/D` viene usato solo quando il dato storico non è realmente disponibile
+
+
+## V1.9 — lista asset esterna .txt
+
+Nella sidebar è disponibile un upload opzionale di un file `.txt`.
+
+Comportamento:
+- se NON viene caricato alcun file, l'app usa l'universo predefinito;
+- se viene caricato un file, l'app usa esclusivamente gli asset presenti nel file;
+- righe vuote e righe che iniziano con `#` vengono ignorate.
+
+Formati accettati:
+
+```text
+Nvidia,NVDA
+Apple,AAPL
+Gold Future,GC=F
+```
+
+oppure, più semplicemente:
+
+```text
+NVDA
+AAPL
+GC=F
+```
+
+Nel secondo caso il ticker viene usato anche come nome visualizzato.
+
+È incluso `asset_list_example.txt` con l'universo predefinito completo.

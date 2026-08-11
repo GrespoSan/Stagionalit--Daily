@@ -353,6 +353,51 @@ def analyze_target(
     return result
 
 
+def parse_universe_text(text: str) -> tuple[dict, list]:
+    """
+    Formati accettati:
+    - Nome,Ticker
+    - Ticker
+
+    Ignora righe vuote e commenti che iniziano con #.
+    Se è presente solo il ticker, il nome visualizzato coincide con il ticker.
+    """
+    universe = {}
+    bad_rows = []
+
+    for raw in text.splitlines():
+        raw = raw.strip()
+        if not raw or raw.startswith("#"):
+            continue
+
+        if "," in raw:
+            parts = [p.strip() for p in raw.split(",", 1)]
+            if len(parts) != 2 or not parts[0] or not parts[1]:
+                bad_rows.append(raw)
+                continue
+            name, ticker = parts
+        else:
+            ticker = raw.strip()
+            name = ticker
+
+        # Evita duplicati di ticker mantenendo la prima occorrenza.
+        if ticker not in universe.values():
+            universe[name] = ticker
+
+    return universe, bad_rows
+
+
+def decode_uploaded_txt(uploaded_file) -> str:
+    raw = uploaded_file.getvalue()
+    # UTF-8 con BOM, poi fallback latin-1 per file Windows/legacy.
+    for enc in ("utf-8-sig", "utf-8", "latin-1"):
+        try:
+            return raw.decode(enc)
+        except UnicodeDecodeError:
+            pass
+    return raw.decode("utf-8", errors="replace")
+
+
 def pct(v):
     if pd.isna(v):
         return "n/d"
@@ -397,11 +442,40 @@ with st.sidebar:
     st.divider()
     st.subheader("Universo")
 
-    universe_text = st.text_area(
-        "Una riga per asset: Nome,Ticker Yahoo",
-        value="\n".join(f"{k},{v}" for k, v in DEFAULT_UNIVERSE.items()),
-        height=210,
+    uploaded_universe = st.file_uploader(
+        "Lista asset esterna (.txt) — opzionale",
+        type=["txt"],
+        help=(
+            "Se carichi un file .txt, l'app usa quella lista al posto "
+            "dell'universo predefinito. Formati accettati: Nome,Ticker oppure solo Ticker."
+        ),
     )
+
+    if uploaded_universe is None:
+        st.caption(f"Universo attivo: **predefinito ({len(DEFAULT_UNIVERSE)} asset)**")
+        st.text_area(
+            "Asset predefiniti",
+            value="\n".join(f"{k},{v}" for k, v in DEFAULT_UNIVERSE.items()),
+            height=210,
+            disabled=True,
+        )
+    else:
+        uploaded_text = decode_uploaded_txt(uploaded_universe)
+        uploaded_preview, uploaded_bad_rows = parse_universe_text(uploaded_text)
+        st.caption(
+            f"Universo attivo: **file {uploaded_universe.name} "
+            f"({len(uploaded_preview)} asset validi)**"
+        )
+        st.text_area(
+            "Anteprima file caricato",
+            value=uploaded_text,
+            height=210,
+            disabled=True,
+        )
+        if uploaded_bad_rows:
+            st.warning(
+                "Righe non valide nel file: " + " | ".join(uploaded_bad_rows)
+            )
 
     st.caption(
         "DAX e Euro Stoxx 50 sono analizzati sul cash index come proxy "
@@ -422,25 +496,27 @@ st.info(
 if not run:
     st.stop()
 
-# Parse universo
-universe = {}
-bad_rows = []
-for raw in universe_text.splitlines():
-    raw = raw.strip()
-    if not raw:
-        continue
-    parts = [p.strip() for p in raw.split(",", 1)]
-    if len(parts) != 2 or not parts[0] or not parts[1]:
-        bad_rows.append(raw)
-    else:
-        universe[parts[0]] = parts[1]
+# Risoluzione universo:
+# - nessun file -> universo predefinito
+# - file presente -> usa esclusivamente il contenuto del file
+if uploaded_universe is None:
+    universe = DEFAULT_UNIVERSE.copy()
+    bad_rows = []
+    universe_source = "predefinito"
+else:
+    uploaded_text = decode_uploaded_txt(uploaded_universe)
+    universe, bad_rows = parse_universe_text(uploaded_text)
+    universe_source = uploaded_universe.name
 
 if bad_rows:
     st.error("Righe universo non valide: " + " | ".join(bad_rows))
     st.stop()
 
 if not universe:
-    st.error("Inserisci almeno un asset.")
+    st.error(
+        "Il file caricato non contiene asset validi. "
+        "Usa una riga per asset nel formato Nome,Ticker oppure Ticker."
+    )
     st.stop()
 
 # Calendario abbastanza ampio per la finestra 20Y.
@@ -493,7 +569,7 @@ opps = opps.sort_values(["Date", "Score"], ascending=[True, False])
 
 c1, c2, c3 = st.columns(3)
 c1.metric("Sedute analizzate", len(targets))
-c2.metric("Asset analizzati", len(universe))
+c2.metric("Asset analizzati", len(universe), help=f"Fonte universo: {universe_source}")
 c3.metric("Opportunità valide", len(opps))
 
 st.subheader("Opportunità della settimana")

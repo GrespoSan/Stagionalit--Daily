@@ -1,0 +1,23 @@
+# Seasonality Weekly Scanner - esempio lista asset
+# Formato consigliato: Nome,Ticker Yahoo
+# In alternativa è possibile inserire solo il ticker.
+
+Nvidia,NVDA
+Alphabet A,GOOGL
+Apple,AAPL
+Microsoft,MSFT
+Amazon,AMZN
+Broadcom,AVGO
+Meta Platforms,META
+Berkshire Hathaway B,BRK-B
+Tesla,TSLA
+Eli Lilly,LLY
+E-mini S&P 500 Future,ES=F
+Nasdaq 100 Future,NQ=F
+Mini Dow Future,YM=F
+E-mini Russell 2000 Future,RTY=F
+DAX (proxy cash),^GDAXI
+Euro Stoxx 50 (proxy cash),^STOXX50E
+Gold Future,GC=F
+WTI Crude Oil Future,CL=F
+Copper Future,HG=F
