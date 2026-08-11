@@ -117,3 +117,35 @@ Alphabet viene mantenuta una sola volta tramite GOOGL.
 - `Median 15Y` rimossa dalla tabella principale perché non entra nel filtro né nel target.
 - `Median 15Y` resta visibile nel Dettaglio storico.
 - `Forza mov.` e `Score` spostate subito dopo `Bias` per rendere immediata la lettura operativa.
+
+
+## V1.6 — Target/ATR più leggibile
+
+Il rapporto Target/ATR viene ora mostrato come percentuale dell'ATR.
+
+Esempio:
+- Target = 0,8%
+- ATR5 = 3,4%
+- Target/ATR5 = 24%
+
+Significa che il target stagionale equivale a circa il 24% dell'ATR5.
+
+
+## V1.7 — valori operativi in punti
+
+La tabella principale mostra ora:
+- ATR5 pts (o il periodo ATR selezionato)
+- Target pts
+
+`Target pts` è il movimento di prezzo corrispondente al target stagionale.
+È matematicamente equivalente a:
+
+Target pts = ATR pts × Target/ATR
+
+Esempio:
+ATR5 = 6,80 punti
+Target/ATR5 = 25%
+Target = 1,70 punti
+
+Per futures i "punti" sono punti del contratto/quotazione.
+Per azioni sono unità di prezzo (es. dollari per azione).

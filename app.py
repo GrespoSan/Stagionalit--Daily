@@ -332,8 +332,10 @@ def analyze_target(
         "Median 15Y": stats[15]["median"],
         "Target orig.": original_target,
         "Stop orig.": original_stop,
+        "ATR pts": atr_value,
         "ATR%": atr_pct,
         "Target/ATR": target_atr,
+        "Target pts": (atr_value * target_atr) if not pd.isna(atr_value) and not pd.isna(target_atr) else np.nan,
         "Forza mov.": move_quality,
         "Score": score,
         "N10": stats[10]["n"],
@@ -502,14 +504,25 @@ else:
             "10Y", "15Y", "20Y",
             "Avg 10Y", "Avg 15Y", "Avg 20Y", "Mediana 3 rend.",
             "Target orig.", "Stop orig.",
-            "ATR%", "Target/ATR"
+            "ATR pts", "Target pts"
         ]
     ].copy()
 
-    for col in ["10Y", "15Y", "20Y", "Avg 10Y", "Avg 15Y", "Avg 20Y", "Mediana 3 rend.", "Target orig.", "Stop orig.", "ATR%", "Score"]:
+    for col in ["10Y", "15Y", "20Y", "Avg 10Y", "Avg 15Y", "Avg 20Y", "Mediana 3 rend.", "Target orig.", "Stop orig.", "Score"]:
         display[col] = display[col].map(pct)
-    display["Target/ATR"] = display["Target/ATR"].map(
-        lambda x: "n/d" if pd.isna(x) else f"{x:.2f}"
+
+    display["ATR pts"] = display["ATR pts"].map(
+        lambda x: "n/d" if pd.isna(x) else f"{x:,.2f}"
+    )
+    display["Target pts"] = display["Target pts"].map(
+        lambda x: "n/d" if pd.isna(x) else f"{x:,.2f}"
+    )
+
+    display = display.rename(
+        columns={
+            "ATR pts": f"ATR{int(atr_period)} pts",
+            "Target pts": "Target pts"
+        }
     )
 
     def color_bias(val):
@@ -570,12 +583,16 @@ if valid_keys:
         f"**Mediana dei 3 rendimenti:** {pct(original['Mediana 3 rend.'])}  ·  "
         f"**Mediana storica 15Y:** {pct(original['Median 15Y'])}"
     )
-    target_atr_txt = "n/d" if pd.isna(original["Target/ATR"]) else f"{original['Target/ATR']:.2f}"
+    atr_pts_txt = "n/d" if pd.isna(original["ATR pts"]) else f"{original['ATR pts']:,.2f}"
+    target_pts_txt = "n/d" if pd.isna(original["Target pts"]) else f"{original['Target pts']:,.2f}"
+    target_atr_txt = "n/d" if pd.isna(original["Target/ATR"]) else f"{original['Target/ATR']:.0%}"
+
     st.write(
         f"**TP originale:** {pct(original['Target orig.'])}  ·  "
         f"**SL originale:** {pct(original['Stop orig.'])}  ·  "
-        f"**ATR{int(atr_period)}:** {pct(original['ATR%'])}  ·  "
-        f"**Target/ATR:** {target_atr_txt}  ·  "
+        f"**ATR{int(atr_period)}:** {atr_pts_txt} punti  ·  "
+        f"**Target:** {target_pts_txt} punti  ·  "
+        f"**Target/ATR{int(atr_period)}:** {target_atr_txt}  ·  "
         f"**Forza movimento:** {original['Forza mov.']}"
     )
 
@@ -602,10 +619,11 @@ with st.expander("Diagnostica dati / campione"):
 
 st.divider()
 st.info(
-    "**Forza movimento:** Target/ATR confronta il target stagionale con la volatilità "
-    f"recente ATR{int(atr_period)}. <0,30 = DEBOLE · 0,30–0,50 = MEDIO · "
-    "0,50–0,75 = BUONO · ≥0,75 = FORTE. Per ora è solo una classificazione: "
-    "non elimina automaticamente nessun segnale."
+    f"**Forza movimento:** l'app confronta internamente il target stagionale con l'ATR{int(atr_period)}. "
+    "Nella tabella principale mostriamo direttamente i valori operativi: "
+    f"ATR{int(atr_period)} in punti e Target in punti. "
+    "La classe resta: <30% ATR = DEBOLE · 30–50% = MEDIO · "
+    "50–75% = BUONO · ≥75% = FORTE."
 )
 
 st.caption(
