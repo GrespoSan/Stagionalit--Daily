@@ -7,7 +7,7 @@ App Streamlit per individuare le opportunità settimanali secondo il metodo:
 - stagionalità 20 anni
 - LONG solo se la percentuale positiva è >= 70% in tutte e tre le finestre
 - SHORT solo se la percentuale negativa è >= 70% in tutte e tre le finestre
-- target originale = valore assoluto della media dei tre rendimenti medi 10Y, 15Y e 20Y
+- target originale = valore assoluto della mediana (valore centrale) dei tre rendimenti medi 10Y, 15Y e 20Y
 - stop originale = metà del target
 
 ## Punto metodologico
@@ -59,3 +59,35 @@ e non considera il TP/SL originale come già validato.
 Il passo successivo, solo se lo scanner produce opportunità interessanti,
 è costruire un backtest specifico delle regole di ingresso/uscita descritte
 nella strategia originale.
+
+
+## Universo V1.3
+
+### Top 10 titoli
+- NVDA
+- GOOGL
+- GOOG
+- AAPL
+- MSFT
+- AMZN
+- AVGO
+- META
+- BRK-B
+- TSLA
+
+### Indici / futures
+- E-mini S&P 500: ES=F
+- Nasdaq 100 Future: NQ=F
+- Mini Dow: YM=F
+- E-mini Russell 2000: RTY=F
+- DAX: ^GDAXI (cash proxy)
+- Euro Stoxx 50: ^STOXX50E (cash proxy)
+
+### Commodity futures
+- Gold: GC=F
+- WTI Crude Oil: CL=F
+- Copper: HG=F
+
+DAX ed Euro Stoxx 50 vengono volutamente analizzati tramite il cash index:
+i continuous futures Eurex disponibili gratuitamente via Yahoo non sono
+sufficientemente affidabili/coerenti per costruire una stagionalità 20Y.

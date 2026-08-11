@@ -13,13 +13,32 @@ import pandas_market_calendars as mcal
 APP_TITLE = "Seasonality Weekly Scanner"
 
 DEFAULT_UNIVERSE = {
-    "S&P 500": "^GSPC",
-    "Nasdaq 100": "^NDX",
+    # Top 10 mostrati nella classifica fornita
+    "Nvidia": "NVDA",
+    "Alphabet A": "GOOGL",
+    "Alphabet C": "GOOG",
     "Apple": "AAPL",
     "Microsoft": "MSFT",
-    "Nvidia": "NVDA",
-    "Alphabet": "GOOGL",
     "Amazon": "AMZN",
+    "Broadcom": "AVGO",
+    "Meta Platforms": "META",
+    "Berkshire Hathaway B": "BRK-B",
+    "Tesla": "TSLA",
+
+    # Principali futures su indici USA
+    "E-mini S&P 500 Future": "ES=F",
+    "Nasdaq 100 Future": "NQ=F",
+    "Mini Dow Future": "YM=F",
+    "E-mini Russell 2000 Future": "RTY=F",
+
+    # Europa: proxy cash per avere una serie Yahoo coerente e lunga
+    "DAX (proxy cash)": "^GDAXI",
+    "Euro Stoxx 50 (proxy cash)": "^STOXX50E",
+
+    # Commodity futures
+    "Gold Future": "GC=F",
+    "WTI Crude Oil Future": "CL=F",
+    "Copper Future": "HG=F",
 }
 
 WINDOWS = (10, 15, 20)
@@ -97,13 +116,25 @@ def next_week_bounds(ref: date) -> tuple[date, date]:
 
 
 def trading_targets(start_d: date, end_d: date, schedule: pd.DataFrame) -> pd.DataFrame:
-    idx = schedule.loc[
-        (schedule.index.date >= start_d) & (schedule.index.date <= end_d)
-    ].copy()
-    if idx.empty:
+    """
+    Genera lunedì-venerdì senza imporre il calendario NYSE.
+    Questo evita di perdere giornate europee/commodity quando Wall Street
+    è chiusa. Le festività storiche vengono comunque escluse naturalmente
+    perché la data non è presente nella serie dello strumento.
+    """
+    dates = pd.date_range(start=start_d, end=end_d, freq="D")
+    dates = [d for d in dates if d.weekday() < 5]
+    if not dates:
         return pd.DataFrame(columns=["date", "month", "tdom"])
-    idx["date"] = idx.index.date
-    return idx[["date", "month", "tdom"]]
+
+    rows = []
+    for d in dates:
+        rows.append({
+            "date": d.date(),
+            "month": d.month,
+            "tdom": 0,   # mantenuto solo per compatibilità; non usato dal metodo Forecaster
+        })
+    return pd.DataFrame(rows)
 
 
 def seasonal_sample(
@@ -216,15 +247,15 @@ def analyze_target(
     avg15 = stats[15]["avg"]
     avg20 = stats[20]["avg"]
 
-    # Strategia originale: target = media dei tre rendimenti medi
-    # calcolati sulle finestre 10Y, 15Y e 20Y.
+    # Strategia originale: target = valore CENTRALE (mediana)
+    # dei tre rendimenti medi 10Y, 15Y e 20Y.
     avg_returns = [avg10, avg15, avg20]
     if bias != "—" and all(not math.isnan(x) for x in avg_returns):
-        target_mean_3 = float(np.mean(avg_returns))
-        original_target = abs(target_mean_3)
+        target_median_3 = float(np.median(avg_returns))
+        original_target = abs(target_median_3)
         original_stop = original_target / 2
     else:
-        target_mean_3 = np.nan
+        target_median_3 = np.nan
         original_target = np.nan
         original_stop = np.nan
 
@@ -248,7 +279,7 @@ def analyze_target(
         "Avg 10Y": avg10,
         "Avg 15Y": avg15,
         "Avg 20Y": avg20,
-        "Media 3 rend.": target_mean_3,
+        "Mediana 3 rend.": target_median_3,
         "Median 15Y": stats[15]["median"],
         "Target orig.": original_target,
         "Stop orig.": original_stop,
@@ -299,6 +330,12 @@ with st.sidebar:
         "Una riga per asset: Nome,Ticker Yahoo",
         value="\n".join(f"{k},{v}" for k, v in DEFAULT_UNIVERSE.items()),
         height=210,
+    )
+
+    st.caption(
+        "DAX e Euro Stoxx 50 sono analizzati sul cash index come proxy "
+        "stagionale; gli altri strumenti indicati come Future usano i "
+        "continuous futures Yahoo."
     )
 
     run = st.button("Analizza settimana", type="primary", width="stretch")
@@ -399,15 +436,23 @@ else:
         [
             "Date", "Asset", "Ticker", "Bias",
             "10Y", "15Y", "20Y",
-            "Avg 10Y", "Avg 15Y", "Avg 20Y", "Media 3 rend.",
+            "Avg 10Y", "Avg 15Y", "Avg 20Y", "Mediana 3 rend.",
             "Median 15Y", "Target orig.", "Stop orig.", "Score"
         ]
     ].copy()
 
-    for col in ["10Y", "15Y", "20Y", "Avg 10Y", "Avg 15Y", "Avg 20Y", "Media 3 rend.", "Median 15Y", "Target orig.", "Stop orig.", "Score"]:
+    for col in ["10Y", "15Y", "20Y", "Avg 10Y", "Avg 15Y", "Avg 20Y", "Mediana 3 rend.", "Median 15Y", "Target orig.", "Stop orig.", "Score"]:
         display[col] = display[col].map(pct)
 
-    st.dataframe(display, width="stretch", hide_index=True)
+    def color_bias(val):
+        if val == "SHORT":
+            return "color: #ff4b4b; font-weight: 700;"
+        if val == "LONG":
+            return "color: #21c55d; font-weight: 700;"
+        return ""
+
+    styled_display = display.style.map(color_bias, subset=["Bias"])
+    st.dataframe(styled_display, width="stretch", hide_index=True)
 
 st.divider()
 st.subheader("Dettaglio storico")
@@ -441,7 +486,7 @@ if valid_keys:
         f"**Avg 10Y:** {pct(original['Avg 10Y'])}  ·  "
         f"**Avg 15Y:** {pct(original['Avg 15Y'])}  ·  "
         f"**Avg 20Y:** {pct(original['Avg 20Y'])}  ·  "
-        f"**Media dei 3 rendimenti:** {pct(original['Media 3 rend.'])}"
+        f"**Mediana dei 3 rendimenti:** {pct(original['Mediana 3 rend.'])}"
     )
     st.write(
         f"**TP originale:** {pct(original['Target orig.'])}  ·  "
@@ -454,7 +499,7 @@ if valid_keys:
 
     st.caption(
         "Il TP e lo SL mostrati replicano la regola descritta: "
-        "target = valore assoluto della media dei rendimenti medi 10Y, 15Y e 20Y; "
+        "target = valore assoluto della mediana dei rendimenti medi 10Y, 15Y e 20Y; "
         "stop = metà del target. "
         "La V1 NON afferma ancora che questo TP/SL sia ottimale."
     )
