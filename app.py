@@ -326,6 +326,12 @@ def analyze_target(
         "10Y": stats[10]["long_prob"] if bias == "LONG" else stats[10]["short_prob"] if bias == "SHORT" else np.nan,
         "15Y": stats[15]["long_prob"] if bias == "LONG" else stats[15]["short_prob"] if bias == "SHORT" else np.nan,
         "20Y": stats[20]["long_prob"] if bias == "LONG" else stats[20]["short_prob"] if bias == "SHORT" else np.nan,
+        "10Y LONG raw": stats[10]["long_prob"],
+        "15Y LONG raw": stats[15]["long_prob"],
+        "20Y LONG raw": stats[20]["long_prob"],
+        "10Y SHORT raw": stats[10]["short_prob"],
+        "15Y SHORT raw": stats[15]["short_prob"],
+        "20Y SHORT raw": stats[20]["short_prob"],
         "Avg 10Y": avg10,
         "Avg 15Y": avg15,
         "Avg 20Y": avg20,
@@ -611,10 +617,38 @@ else:
     st.caption("Nessun dettaglio disponibile perché non ci sono opportunità valide.")
 
 with st.expander("Diagnostica dati / campione"):
-    diag = res[["Date", "Asset", "Ticker", "Bias", "10Y", "15Y", "20Y", "N10", "N15", "N20"]].copy()
-    for col in ["10Y", "15Y", "20Y"]:
-        diag[col] = diag[col].map(pct)
+    diag = res[
+        [
+            "Date", "Asset", "Ticker", "Bias",
+            "10Y LONG raw", "10Y SHORT raw",
+            "15Y LONG raw", "15Y SHORT raw",
+            "20Y LONG raw", "20Y SHORT raw",
+            "N10", "N15", "N20"
+        ]
+    ].copy()
+
+    # Mostra sempre le statistiche disponibili, anche quando non passa il filtro 70/70/70.
+    rename_map = {
+        "10Y LONG raw": "10Y LONG",
+        "10Y SHORT raw": "10Y SHORT",
+        "15Y LONG raw": "15Y LONG",
+        "15Y SHORT raw": "15Y SHORT",
+        "20Y LONG raw": "20Y LONG",
+        "20Y SHORT raw": "20Y SHORT",
+    }
+    diag = diag.rename(columns=rename_map)
+
+    for col in ["10Y LONG", "10Y SHORT", "15Y LONG", "15Y SHORT", "20Y LONG", "20Y SHORT"]:
+        diag[col] = diag[col].map(lambda x: "N/D" if pd.isna(x) else f"{x:.1%}")
+
     st.dataframe(diag, width="stretch", hide_index=True)
+
+    st.caption(
+        "Bias = — significa che i dati esistono ma la giornata non supera il filtro "
+        "70/70/70 né LONG né SHORT. N/D viene usato solo quando il dato storico "
+        "non è realmente disponibile."
+    )
+
     if data_errors:
         st.warning("\n".join(data_errors))
 

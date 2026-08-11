@@ -149,3 +149,11 @@ Target = 1,70 punti
 
 Per futures i "punti" sono punti del contratto/quotazione.
 Per azioni sono unità di prezzo (es. dollari per azione).
+
+
+## V1.8
+
+- aggiunto Eli Lilly (`LLY`) all'universo
+- la Diagnostica mostra sempre le probabilità LONG e SHORT reali su 10Y/15Y/20Y
+- `Bias = —` significa "nessun segnale valido"
+- `N/D` viene usato solo quando il dato storico non è realmente disponibile
