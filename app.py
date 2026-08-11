@@ -498,14 +498,15 @@ else:
     display = opps[
         [
             "Date", "Asset", "Ticker", "Bias",
+            "Forza mov.", "Score",
             "10Y", "15Y", "20Y",
             "Avg 10Y", "Avg 15Y", "Avg 20Y", "Mediana 3 rend.",
-            "Median 15Y", "Target orig.", "Stop orig.",
-            "ATR%", "Target/ATR", "Forza mov.", "Score"
+            "Target orig.", "Stop orig.",
+            "ATR%", "Target/ATR"
         ]
     ].copy()
 
-    for col in ["10Y", "15Y", "20Y", "Avg 10Y", "Avg 15Y", "Avg 20Y", "Mediana 3 rend.", "Median 15Y", "Target orig.", "Stop orig.", "ATR%", "Score"]:
+    for col in ["10Y", "15Y", "20Y", "Avg 10Y", "Avg 15Y", "Avg 20Y", "Mediana 3 rend.", "Target orig.", "Stop orig.", "ATR%", "Score"]:
         display[col] = display[col].map(pct)
     display["Target/ATR"] = display["Target/ATR"].map(
         lambda x: "n/d" if pd.isna(x) else f"{x:.2f}"
@@ -566,7 +567,8 @@ if valid_keys:
         f"**Avg 10Y:** {pct(original['Avg 10Y'])}  ·  "
         f"**Avg 15Y:** {pct(original['Avg 15Y'])}  ·  "
         f"**Avg 20Y:** {pct(original['Avg 20Y'])}  ·  "
-        f"**Mediana dei 3 rendimenti:** {pct(original['Mediana 3 rend.'])}"
+        f"**Mediana dei 3 rendimenti:** {pct(original['Mediana 3 rend.'])}  ·  "
+        f"**Mediana storica 15Y:** {pct(original['Median 15Y'])}"
     )
     target_atr_txt = "n/d" if pd.isna(original["Target/ATR"]) else f"{original['Target/ATR']:.2f}"
     st.write(

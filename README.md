@@ -110,3 +110,10 @@ La classificazione NON filtra ancora i segnali. Serve per raccogliere evidenza
 e capire successivamente se una soglia minima migliora davvero i risultati.
 
 Alphabet viene mantenuta una sola volta tramite GOOGL.
+
+
+## Tabella principale V1.5
+
+- `Median 15Y` rimossa dalla tabella principale perché non entra nel filtro né nel target.
+- `Median 15Y` resta visibile nel Dettaglio storico.
+- `Forza mov.` e `Score` spostate subito dopo `Bias` per rendere immediata la lettura operativa.
