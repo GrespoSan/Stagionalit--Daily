@@ -23,6 +23,7 @@ DEFAULT_UNIVERSE = {
     "Meta Platforms": "META",
     "Berkshire Hathaway B": "BRK-B",
     "Tesla": "TSLA",
+    "Eli Lilly": "LLY",
 
     # Principali futures su indici USA
     "E-mini S&P 500 Future": "ES=F",
