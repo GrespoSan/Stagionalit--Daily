@@ -12,15 +12,17 @@ App Streamlit per individuare le opportunità settimanali secondo il metodo:
 
 ## Punto metodologico
 
-Una data di calendario non è una seduta in tutti gli anni (weekend/festività).
-La V1 confronta quindi la **stessa N-esima seduta dello stesso mese**.
+La V1 replica il comportamento osservato in Forecaster:
+confronta lo **stesso giorno di calendario** nei precedenti 10, 15 e 20 anni.
 
 Esempio:
-- target = 12ª seduta di agosto 2026
-- storico = 12ª seduta di agosto 2025, 2024, 2023, ecc.
+- target = 11 agosto 2026
+- storico = 11 agosto 2025, 2024, 2023, ecc.
+- se l'11 agosto di un anno cade nel weekend o non è una seduta, quell'anno viene escluso.
 
-Questo permette di avere fino a una osservazione per anno e rende possibili
-campioni reali di 10/15/20 anni.
+Di conseguenza il denominatore reale può essere inferiore a 10/15/20.
+Per esempio, l'11 agosto nei 10 anni precedenti al 2026 è una seduta in 7 anni:
+6 casi SHORT su 7 producono 85,7%, visualizzato come 86%.
 
 ## Prezzi
 

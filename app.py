@@ -115,31 +115,33 @@ def seasonal_sample(
     schedule: pd.DataFrame,
 ) -> pd.DataFrame:
     """
-    Confronta la target con la stessa N-esima seduta dello stesso mese
-    in ciascuno dei precedenti N anni.
+    Replica Forecaster: confronta lo STESSO GIORNO DI CALENDARIO
+    (mese + giorno) nei precedenti N anni.
 
+    Se quella data cade di sabato/domenica/festivo, l'anno viene escluso.
     Il rendimento è close-to-close della seduta selezionata.
     """
     target_year = target_date.year
-    wanted_years = list(range(target_year - years, target_year))
-
-    hist_sched = schedule.loc[
-        (schedule["year"].isin(wanted_years))
-        & (schedule["month"] == target_month)
-        & (schedule["tdom"] == target_tdom)
-    ]
+    wanted_years = range(target_year - years, target_year)
 
     rows = []
-    for dt, srow in hist_sched.iterrows():
-        if dt not in df.index:
-            # Alcuni strumenti possono avere calendario diverso o dati mancanti.
+    for y in wanted_years:
+        try:
+            dt = pd.Timestamp(date(y, target_date.month, target_date.day))
+        except ValueError:
             continue
+
+        # La data deve essere una vera seduta presente nei dati dello strumento.
+        if dt not in df.index:
+            continue
+
         r = df.at[dt, "Return"]
         if pd.isna(r):
             continue
+
         rows.append(
             {
-                "Year": int(srow["year"]),
+                "Year": int(y),
                 "Date": dt.date(),
                 "Return": float(r),
             }
@@ -149,10 +151,12 @@ def seasonal_sample(
 
 
 def stats_for_window(sample: pd.DataFrame, expected_n: int) -> dict:
+    # Forecaster usa le osservazioni realmente disponibili all'interno
+    # dei N anni di calendario; weekend e festività non entrano nel denominatore.
     n = len(sample)
-    if n < expected_n:
+    if n == 0:
         return {
-            "n": n,
+            "n": 0,
             "long_prob": np.nan,
             "short_prob": np.nan,
             "avg": np.nan,
@@ -300,10 +304,11 @@ with st.sidebar:
     run = st.button("Analizza settimana", type="primary", width="stretch")
 
 st.info(
-    "**Metodo di allineamento:** per ogni giornata futura viene usata la stessa "
-    "N-esima seduta dello stesso mese nei 10, 15 e 20 anni precedenti. "
-    "Esempio: la 12ª seduta di agosto viene confrontata con la 12ª seduta "
-    "di agosto di ciascun anno storico."
+    "**Metodo Forecaster:** per ogni giornata futura viene usato lo stesso "
+    "giorno di calendario nei 10, 15 e 20 anni precedenti. "
+    "Se in un determinato anno quella data cade nel weekend o non è una seduta, "
+    "quell'anno viene escluso dal campione. Esempio: l'11 agosto viene confrontato "
+    "solo con gli 11 agosto che sono stati effettive sedute di borsa."
 )
 
 if not run:
@@ -457,7 +462,9 @@ else:
     st.caption("Nessun dettaglio disponibile perché non ci sono opportunità valide.")
 
 with st.expander("Diagnostica dati / campione"):
-    diag = res[["Date", "Asset", "Ticker", "N10", "N15", "N20"]].copy()
+    diag = res[["Date", "Asset", "Ticker", "Bias", "10Y", "15Y", "20Y", "N10", "N15", "N20"]].copy()
+    for col in ["10Y", "15Y", "20Y"]:
+        diag[col] = diag[col].map(pct)
     st.dataframe(diag, width="stretch", hide_index=True)
     if data_errors:
         st.warning("\n".join(data_errors))
