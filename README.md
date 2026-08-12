@@ -234,3 +234,45 @@ Sono esclusi dal calcolo:
 
 Il pulsante `Analizza settimana` è stato spostato subito sotto il controllo
 `ATR periodi per forza movimento`, prima della sezione Universo.
+
+
+## V3.0 — Backtest manuale
+
+Nuova sezione indipendente per testare la strategia giorno per giorno.
+
+Parametri:
+- data inizio / fine
+- filtro stagionale minimo
+- ATR period
+- forza minima: TUTTI / MEDIO+ / BUONO+ / SOLO FORTE
+- stop in multipli ATR
+- LONG + SHORT / solo LONG / solo SHORT
+- filtro opzionale coerenza Bias / rendimento medio
+- copertura minima del campione
+
+Regole:
+- entry = Open della seduta
+- target = target stagionale in punti
+- stop = multiplo ATR selezionato
+- se target e stop non vengono toccati -> uscita al Close
+- se target e stop risultano entrambi toccati e non è ricostruibile l'ordine -> NO DATI
+
+Metriche:
+- Segnali
+- Valutabili
+- NO DATI
+- WIN / LOSS
+- Win Rate
+- Profit Factor
+- Expectancy in R
+- Totale R
+- Max Drawdown in R
+- equity cumulata
+- risultati per Forza
+- risultati per Asset
+- trade log completo
+
+`NO DATI` è escluso dalle statistiche di performance.
+
+La V3.0 è volutamente manuale. L'ottimizzatore automatico dei parametri va aggiunto
+solo dopo aver verificato che questo motore di backtest produca risultati coerenti.

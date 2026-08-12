@@ -113,12 +113,12 @@ def download_intraday_5m(ticker: str, target_date: date) -> pd.DataFrame:
     return df.dropna(subset=["High","Low"]).sort_index()
 
 def resolve_intraday_order(bars: pd.DataFrame,bias: str,target_level: float,stop_level: float) -> str:
-    if bars is None or bars.empty: return "AMBIGUO"
+    if bars is None or bars.empty: return "NO DATI"
     for _,bar in bars.iterrows():
         hi=float(bar["High"]); lo=float(bar["Low"])
         if bias=="LONG": hit_target=hi>=target_level; hit_stop=lo<=stop_level
         else: hit_target=lo<=target_level; hit_stop=hi>=stop_level
-        if hit_target and hit_stop: return "AMBIGUO"
+        if hit_target and hit_stop: return "NO DATI"
         if hit_target: return "WIN"
         if hit_stop: return "LOSS"
     return "NO HIT"
@@ -411,6 +411,465 @@ def analyze_target(
     return result
 
 
+
+def strength_min_ratio(label: str) -> float:
+    mapping = {
+        "TUTTI": 0.0,
+        "MEDIO+": 0.30,
+        "BUONO+": 0.50,
+        "SOLO FORTE": 0.75,
+    }
+    return mapping.get(label, 0.0)
+
+
+def signal_return_coherent(row: dict) -> bool:
+    """
+    Coerenza opzionale:
+    LONG -> mediana dei 3 rendimenti > 0
+    SHORT -> mediana dei 3 rendimenti < 0
+    """
+    m = row.get("Mediana 3 rend.", np.nan)
+    if pd.isna(m):
+        return False
+    if row.get("Bias") == "LONG":
+        return m > 0
+    if row.get("Bias") == "SHORT":
+        return m < 0
+    return False
+
+
+def evaluate_backtest_trade(
+    ticker: str,
+    df: pd.DataFrame,
+    target_date: date,
+    bias: str,
+    target_pts: float,
+    atr_pts: float,
+    stop_atr_mult: float,
+) -> dict:
+    """
+    Entry: Open della seduta.
+    Target: +/- target_pts.
+    Stop: stop_atr_mult * ATR.
+    Se nessuno dei due viene raggiunto: uscita al Close.
+    Se target e stop sono entrambi toccati e l'ordine non è ricostruibile: NO DATI.
+    """
+    result = {
+        "Open": np.nan,
+        "Close": np.nan,
+        "Target level": np.nan,
+        "Stop level": np.nan,
+        "SL pts": np.nan,
+        "Exit price": np.nan,
+        "Exit reason": "NO DATI",
+        "Outcome": "NO DATI",
+        "PnL pts": np.nan,
+        "R": np.nan,
+    }
+
+    if bias not in ("LONG", "SHORT"):
+        return result
+
+    if pd.isna(target_pts) or pd.isna(atr_pts) or atr_pts <= 0 or target_pts < 0:
+        return result
+
+    dt = pd.Timestamp(target_date)
+    if dt not in df.index:
+        return result
+
+    row = df.loc[dt]
+    op, hi, lo, cl = row["Open"], row["High"], row["Low"], row["Close"]
+    if any(pd.isna(x) for x in (op, hi, lo, cl)):
+        return result
+
+    op, hi, lo, cl = map(float, (op, hi, lo, cl))
+    sl_pts = float(stop_atr_mult) * float(atr_pts)
+    if sl_pts <= 0:
+        return result
+
+    if bias == "LONG":
+        target_level = op + float(target_pts)
+        stop_level = op - sl_pts
+        hit_target = hi >= target_level
+        hit_stop = lo <= stop_level
+    else:
+        target_level = op - float(target_pts)
+        stop_level = op + sl_pts
+        hit_target = lo <= target_level
+        hit_stop = hi >= stop_level
+
+    result.update({
+        "Open": op,
+        "Close": cl,
+        "Target level": target_level,
+        "Stop level": stop_level,
+        "SL pts": sl_pts,
+    })
+
+    # Caso univoco dal daily
+    if hit_target and not hit_stop:
+        result.update({
+            "Exit price": target_level,
+            "Exit reason": "TARGET",
+            "Outcome": "WIN",
+            "PnL pts": float(target_pts),
+            "R": float(target_pts) / sl_pts,
+        })
+        return result
+
+    if hit_stop and not hit_target:
+        result.update({
+            "Exit price": stop_level,
+            "Exit reason": "STOP",
+            "Outcome": "LOSS",
+            "PnL pts": -sl_pts,
+            "R": -1.0,
+        })
+        return result
+
+    # Entrambi toccati: prova intraday solo se plausibilmente disponibile.
+    if hit_target and hit_stop:
+        if target_date < (date.today() - timedelta(days=60)):
+            return result
+
+        bars = download_intraday_5m(ticker, target_date)
+        order = resolve_intraday_order(bars, bias, target_level, stop_level)
+
+        if order == "WIN":
+            result.update({
+                "Exit price": target_level,
+                "Exit reason": "TARGET",
+                "Outcome": "WIN",
+                "PnL pts": float(target_pts),
+                "R": float(target_pts) / sl_pts,
+            })
+        elif order == "LOSS":
+            result.update({
+                "Exit price": stop_level,
+                "Exit reason": "STOP",
+                "Outcome": "LOSS",
+                "PnL pts": -sl_pts,
+                "R": -1.0,
+            })
+        # altrimenti resta NO DATI
+        return result
+
+    # Nessuno dei due: chiusura a fine seduta.
+    if bias == "LONG":
+        pnl_pts = cl - op
+    else:
+        pnl_pts = op - cl
+
+    if pnl_pts > 0:
+        outcome = "WIN"
+    elif pnl_pts < 0:
+        outcome = "LOSS"
+    else:
+        outcome = "FLAT"
+
+    result.update({
+        "Exit price": cl,
+        "Exit reason": "CLOSE",
+        "Outcome": outcome,
+        "PnL pts": pnl_pts,
+        "R": pnl_pts / sl_pts,
+    })
+    return result
+
+
+def backtest_metrics(trades: pd.DataFrame) -> dict:
+    """
+    Metriche calcolate solo sui trade con R disponibile.
+    NO DATI è escluso automaticamente.
+    """
+    valid = trades.dropna(subset=["R"]).copy() if not trades.empty else pd.DataFrame()
+    if valid.empty:
+        return {
+            "signals": len(trades),
+            "valid": 0,
+            "no_data": int((trades["Outcome"] == "NO DATI").sum()) if "Outcome" in trades.columns else 0,
+            "wins": 0,
+            "losses": 0,
+            "win_rate": np.nan,
+            "profit_factor": np.nan,
+            "expectancy_r": np.nan,
+            "total_r": np.nan,
+            "max_dd_r": np.nan,
+        }
+
+    wins = int((valid["R"] > 0).sum())
+    losses = int((valid["R"] < 0).sum())
+    decisive = wins + losses
+    gross_profit = float(valid.loc[valid["R"] > 0, "R"].sum())
+    gross_loss = abs(float(valid.loc[valid["R"] < 0, "R"].sum()))
+    pf = gross_profit / gross_loss if gross_loss > 0 else np.inf if gross_profit > 0 else np.nan
+
+    ordered = valid.sort_values(["Date", "Asset"]).copy()
+    equity = ordered["R"].cumsum()
+    peak = equity.cummax()
+    drawdown = equity - peak
+    max_dd = abs(float(drawdown.min())) if len(drawdown) else np.nan
+
+    return {
+        "signals": len(trades),
+        "valid": len(valid),
+        "no_data": int((trades["Outcome"] == "NO DATI").sum()),
+        "wins": wins,
+        "losses": losses,
+        "win_rate": (wins / decisive) if decisive > 0 else np.nan,
+        "profit_factor": pf,
+        "expectancy_r": float(valid["R"].mean()),
+        "total_r": float(valid["R"].sum()),
+        "max_dd_r": max_dd,
+    }
+
+
+def run_manual_backtest(
+    universe: dict,
+    start_date: date,
+    end_date: date,
+    threshold: float,
+    atr_period: int,
+    strength_filter: str,
+    stop_atr_mult: float,
+    direction_filter: str,
+    require_return_coherence: bool,
+    min_sample_coverage: float,
+) -> tuple[pd.DataFrame, list]:
+    """
+    Backtest day-by-day senza look-ahead.
+    Ogni data usa soltanto anni precedenti per la stagionalità e sedute precedenti per ATR.
+    """
+    all_trades = []
+    errors = []
+    min_ratio = strength_min_ratio(strength_filter)
+
+    progress = st.progress(0)
+    status = st.empty()
+
+    items = list(universe.items())
+    for i, (name, ticker) in enumerate(items, start=1):
+        status.write(f"Backtest {name} ({ticker})…")
+        df = download_history(ticker)
+
+        if df.empty:
+            errors.append(f"{name} ({ticker}): dati daily non disponibili")
+            progress.progress(i / len(items))
+            continue
+
+        # Solo sedute realmente presenti nel dataset e già concluse.
+        mask = (
+            (df.index.date >= start_date)
+            & (df.index.date <= end_date)
+            & (df.index.date < date.today())
+        )
+        trade_dates = df.index[mask]
+
+        # schedule è mantenuto per compatibilità con analyze_target; il metodo
+        # Forecaster non usa più la N-esima seduta.
+        schedule = nyse_schedule(start_date.year - 21, end_date.year)
+
+        for dt in trade_dates:
+            d = dt.date()
+            target = pd.Series({"date": d, "month": d.month, "tdom": 0})
+
+            sig = analyze_target(
+                name=name,
+                ticker=ticker,
+                df=df,
+                target=target,
+                threshold=threshold,
+                schedule=schedule,
+                atr_period=int(atr_period),
+            )
+
+            if sig["Bias"] not in ("LONG", "SHORT"):
+                continue
+
+            if direction_filter == "SOLO LONG" and sig["Bias"] != "LONG":
+                continue
+            if direction_filter == "SOLO SHORT" and sig["Bias"] != "SHORT":
+                continue
+
+            # Copertura minima reale delle finestre 10/15/20.
+            coverages = [
+                sig["N10"] / 10 if 10 else 0,
+                sig["N15"] / 15 if 15 else 0,
+                sig["N20"] / 20 if 20 else 0,
+            ]
+            if min(coverages) < min_sample_coverage:
+                continue
+
+            if pd.isna(sig["Target/ATR"]) or sig["Target/ATR"] < min_ratio:
+                continue
+
+            if require_return_coherence and not signal_return_coherent(sig):
+                continue
+
+            trade = evaluate_backtest_trade(
+                ticker=ticker,
+                df=df,
+                target_date=d,
+                bias=sig["Bias"],
+                target_pts=sig["Target pts"],
+                atr_pts=sig["ATR pts"],
+                stop_atr_mult=stop_atr_mult,
+            )
+
+            all_trades.append({
+                "Date": d,
+                "Asset": name,
+                "Ticker": ticker,
+                "Bias": sig["Bias"],
+                "Forza": sig["Forza mov."],
+                "Score": sig["Score"],
+                "10Y": sig["10Y"],
+                "15Y": sig["15Y"],
+                "20Y": sig["20Y"],
+                "N10": sig["N10"],
+                "N15": sig["N15"],
+                "N20": sig["N20"],
+                "Target %": sig["Target orig."],
+                "ATR pts": sig["ATR pts"],
+                "Target pts": sig["Target pts"],
+                "Target/ATR": sig["Target/ATR"],
+                "Coerente": signal_return_coherent(sig),
+                **trade,
+            })
+
+        progress.progress(i / len(items))
+
+    status.empty()
+    progress.empty()
+
+    bt = pd.DataFrame(all_trades)
+    if not bt.empty:
+        bt = bt.sort_values(["Date", "Asset"]).reset_index(drop=True)
+    return bt, errors
+
+
+def format_metric(v, fmt=".2f"):
+    if pd.isna(v):
+        return "n/d"
+    if np.isinf(v):
+        return "∞"
+    return format(v, fmt)
+
+
+def render_backtest_results(bt: pd.DataFrame, errors: list, atr_period: int, stop_atr_mult: float):
+    st.header("🧪 Backtest manuale")
+
+    if bt.empty:
+        st.warning("Nessun trade soddisfa i filtri selezionati nel periodo.")
+        if errors:
+            st.warning("\\n".join(errors))
+        return
+
+    m = backtest_metrics(bt)
+
+    cols = st.columns(9)
+    cols[0].metric("Segnali", m["signals"])
+    cols[1].metric("Valutabili", m["valid"])
+    cols[2].metric("NO DATI", m["no_data"])
+    cols[3].metric("WIN", m["wins"])
+    cols[4].metric("LOSS", m["losses"])
+    cols[5].metric("Win Rate", "n/d" if pd.isna(m["win_rate"]) else f"{m['win_rate']:.1%}")
+    cols[6].metric("Profit Factor", format_metric(m["profit_factor"]))
+    cols[7].metric("Expectancy", "n/d" if pd.isna(m["expectancy_r"]) else f"{m['expectancy_r']:+.3f} R")
+    cols[8].metric("Max DD", "n/d" if pd.isna(m["max_dd_r"]) else f"{m['max_dd_r']:.2f} R")
+
+    st.caption(
+        f"Totale: **{format_metric(m['total_r'], '+.2f')} R** · "
+        f"Stop: **{stop_atr_mult:.2f} × ATR{atr_period}**. "
+        "NO DATI è escluso da tutte le metriche di performance."
+    )
+
+    valid = bt.dropna(subset=["R"]).copy()
+    if not valid.empty:
+        equity = valid.sort_values(["Date", "Asset"])[["Date", "R"]].copy()
+        equity["Equity R"] = equity["R"].cumsum()
+        daily_equity = equity.groupby("Date", as_index=False)["R"].sum()
+        daily_equity["Equity R"] = daily_equity["R"].cumsum()
+        st.subheader("Equity cumulata in R")
+        st.line_chart(daily_equity.set_index("Date")["Equity R"])
+
+    st.subheader("Risultati per forza movimento")
+    strength_order = ["DEBOLE", "MEDIO", "BUONO", "FORTE"]
+    strength_rows = []
+    for strength in strength_order:
+        part = bt[bt["Forza"] == strength]
+        if part.empty:
+            continue
+        mm = backtest_metrics(part)
+        strength_rows.append({
+            "Forza": strength,
+            "Segnali": mm["signals"],
+            "Valutabili": mm["valid"],
+            "NO DATI": mm["no_data"],
+            "Win Rate": mm["win_rate"],
+            "Profit Factor": mm["profit_factor"],
+            "Expectancy R": mm["expectancy_r"],
+            "Totale R": mm["total_r"],
+        })
+    if strength_rows:
+        sf = pd.DataFrame(strength_rows)
+        for c in ["Win Rate"]:
+            sf[c] = sf[c].map(lambda x: "n/d" if pd.isna(x) else f"{x:.1%}")
+        for c in ["Profit Factor", "Expectancy R", "Totale R"]:
+            sf[c] = sf[c].map(lambda x: "n/d" if pd.isna(x) else ("∞" if np.isinf(x) else f"{x:.2f}"))
+        st.dataframe(sf, width="stretch", hide_index=True)
+
+    st.subheader("Risultati per asset")
+    asset_rows = []
+    for asset, part in bt.groupby("Asset"):
+        mm = backtest_metrics(part)
+        asset_rows.append({
+            "Asset": asset,
+            "Segnali": mm["signals"],
+            "Valutabili": mm["valid"],
+            "NO DATI": mm["no_data"],
+            "Win Rate": mm["win_rate"],
+            "Profit Factor": mm["profit_factor"],
+            "Expectancy R": mm["expectancy_r"],
+            "Totale R": mm["total_r"],
+        })
+    af = pd.DataFrame(asset_rows).sort_values("Totale R", ascending=False)
+    af["Win Rate"] = af["Win Rate"].map(lambda x: "n/d" if pd.isna(x) else f"{x:.1%}")
+    for c in ["Profit Factor", "Expectancy R", "Totale R"]:
+        af[c] = af[c].map(lambda x: "n/d" if pd.isna(x) else ("∞" if np.isinf(x) else f"{x:.2f}"))
+    st.dataframe(af, width="stretch", hide_index=True)
+
+    st.subheader("Trade log")
+    disp = bt.copy()
+    for c in ["Score", "10Y", "15Y", "20Y", "Target %"]:
+        disp[c] = disp[c].map(lambda x: "n/d" if pd.isna(x) else f"{x:.1%}")
+    disp["Target/ATR"] = disp["Target/ATR"].map(lambda x: "n/d" if pd.isna(x) else f"{x:.0%}")
+    for c in ["ATR pts", "Target pts", "SL pts", "Open", "Close", "Exit price", "PnL pts", "R"]:
+        disp[c] = disp[c].map(lambda x: "n/d" if pd.isna(x) else f"{x:,.2f}")
+
+    show_cols = [
+        "Date", "Asset", "Ticker", "Bias", "Forza", "Score",
+        "10Y", "15Y", "20Y", "N10", "N15", "N20",
+        "Target %", "ATR pts", "Target pts", "SL pts",
+        "Open", "Exit reason", "Outcome", "PnL pts", "R", "Coerente"
+    ]
+    st.dataframe(disp[show_cols], width="stretch", hide_index=True)
+
+    with st.expander("Note sul backtest"):
+        st.write(
+            "• La stagionalità di ogni data usa esclusivamente anni precedenti alla data testata.\\n"
+            "• L'ATR usa esclusivamente sedute precedenti.\\n"
+            "• Se né target né stop vengono raggiunti, il trade viene chiuso al Close.\\n"
+            "• Se target e stop sono entrambi toccati nella stessa seduta e non possiamo "
+            "stabilire l'ordine con dati intraday, l'esito è NO DATI e il trade non entra nelle metriche.\\n"
+            "• I trade sono valutati singolarmente: questa versione non limita esposizioni "
+            "simultanee o correlazioni tra asset."
+        )
+
+    if errors:
+        st.warning("\\n".join(errors))
+
+
 def parse_universe_text(text: str) -> tuple[dict, list]:
     """
     Formati accettati:
@@ -500,6 +959,70 @@ with st.sidebar:
     run = st.button("Analizza settimana", type="primary", width="stretch")
 
     st.divider()
+    st.subheader("Backtest manuale")
+
+    bt_start = st.date_input(
+        "Data inizio backtest",
+        value=date(date.today().year, 1, 1),
+        key="bt_start",
+    )
+    bt_end = st.date_input(
+        "Data fine backtest",
+        value=date.today(),
+        key="bt_end",
+        help="La seduta odierna viene esclusa finché non è completa."
+    )
+    bt_threshold_pct = st.slider(
+        "Filtro stagionale backtest",
+        min_value=50,
+        max_value=95,
+        value=70,
+        step=1,
+        key="bt_threshold",
+    )
+    bt_atr_period = st.number_input(
+        "ATR periodi backtest",
+        min_value=2,
+        max_value=50,
+        value=5,
+        step=1,
+        key="bt_atr_period",
+    )
+    bt_strength = st.selectbox(
+        "Forza minima",
+        ["TUTTI", "MEDIO+", "BUONO+", "SOLO FORTE"],
+        index=0,
+    )
+    bt_stop_atr = st.slider(
+        "Stop Loss in multipli ATR",
+        min_value=0.25,
+        max_value=1.50,
+        value=0.50,
+        step=0.05,
+        help="0,50 = stop pari al 50% dell'ATR selezionato."
+    )
+    bt_direction = st.selectbox(
+        "Direzione",
+        ["LONG + SHORT", "SOLO LONG", "SOLO SHORT"],
+        index=0,
+    )
+    bt_coherence = st.checkbox(
+        "Richiedi coerenza Bias / rendimento medio",
+        value=False,
+        help="LONG richiede Mediana 3 rendimenti > 0; SHORT richiede < 0."
+    )
+    bt_sample_coverage_pct = st.slider(
+        "Copertura minima campione",
+        min_value=0,
+        max_value=70,
+        value=0,
+        step=5,
+        help="Filtro opzionale sulla quota di osservazioni realmente disponibili nelle finestre 10/15/20 anni."
+    )
+
+    run_backtest = st.button("Esegui backtest", type="secondary", width="stretch")
+
+    st.divider()
     st.subheader("Universo")
 
     uploaded_universe = st.file_uploader(
@@ -551,6 +1074,57 @@ st.info(
     "quell'anno viene escluso dal campione. Esempio: l'11 agosto viene confrontato "
     "solo con gli 11 agosto che sono stati effettive sedute di borsa."
 )
+
+# Se è stato richiesto il backtest, usa lo stesso universo selezionato.
+if run_backtest:
+    if bt_start > bt_end:
+        st.error("La data iniziale del backtest deve essere precedente alla data finale.")
+        st.stop()
+
+    if uploaded_universe is None:
+        bt_universe = DEFAULT_UNIVERSE.copy()
+        bt_bad_rows = []
+        bt_universe_source = "predefinito"
+    else:
+        uploaded_text = decode_uploaded_txt(uploaded_universe)
+        bt_universe, bt_bad_rows = parse_universe_text(uploaded_text)
+        bt_universe_source = uploaded_universe.name
+
+    if bt_bad_rows:
+        st.error("Righe universo non valide: " + " | ".join(bt_bad_rows))
+        st.stop()
+
+    if not bt_universe:
+        st.error("Nessun asset valido nell'universo selezionato.")
+        st.stop()
+
+    st.info(
+        f"Backtest: **{bt_start} → {bt_end}** · "
+        f"Filtro ≥ **{bt_threshold_pct}%** · ATR **{int(bt_atr_period)}** · "
+        f"Forza **{bt_strength}** · Stop **{bt_stop_atr:.2f} ATR** · "
+        f"Universo **{bt_universe_source}**"
+    )
+
+    bt_df, bt_errors = run_manual_backtest(
+        universe=bt_universe,
+        start_date=bt_start,
+        end_date=bt_end,
+        threshold=bt_threshold_pct / 100,
+        atr_period=int(bt_atr_period),
+        strength_filter=bt_strength,
+        stop_atr_mult=float(bt_stop_atr),
+        direction_filter=bt_direction,
+        require_return_coherence=bool(bt_coherence),
+        min_sample_coverage=bt_sample_coverage_pct / 100,
+    )
+
+    render_backtest_results(
+        bt=bt_df,
+        errors=bt_errors,
+        atr_period=int(bt_atr_period),
+        stop_atr_mult=float(bt_stop_atr),
+    )
+    st.stop()
 
 if not run:
     st.stop()
@@ -646,7 +1220,7 @@ c3.metric("Opportunità valide", len(opps))
 c4.metric("WIN", win_count)
 c5.metric("LOSS", loss_count)
 c6.metric("Win Rate", "n/d" if pd.isna(win_rate) else f"{win_rate:.1%}",
-          help="WIN / (WIN + LOSS). NO HIT, PENDING e AMBIGUO sono esclusi.")
+          help="WIN / (WIN + LOSS). NO HIT, PENDING e NO DATI sono esclusi.")
 
 st.subheader("Opportunità della settimana")
 
@@ -708,7 +1282,7 @@ else:
     def color_outcome(val):
         if val == "WIN": return "color: #21c55d; font-weight: 800;"
         if val == "LOSS": return "color: #ff4b4b; font-weight: 800;"
-        if val == "AMBIGUO": return "color: #f0a000; font-weight: 800;"
+        if val == "NO DATI": return "color: #f0a000; font-weight: 800;"
         return ""
 
     styled_display = (
@@ -830,7 +1404,7 @@ st.info(
     f"Stop = Open ∓ 50% dell'ATR{int(atr_period)} in punti. "
     "WIN = target prima dello stop · LOSS = stop prima del target · "
     "NO HIT = nessun livello raggiunto · PENDING = giornata non ancora conclusa · "
-    "AMBIGUO = entrambi i livelli toccati senza ordine determinabile. "
+    "NO DATI = entrambi i livelli toccati senza ordine determinabile. "
     "Forza: <30% ATR = DEBOLE · 30–50% = MEDIO · 50–75% = BUONO · ≥75% = FORTE."
 )
 
