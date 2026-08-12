@@ -658,7 +658,8 @@ def backtest_metrics(trades: pd.DataFrame) -> dict:
 
     ordered = valid.sort_values(["Date", "Asset"]).copy()
     equity = ordered["R"].cumsum()
-    peak = equity.cummax()
+    # Il capitale parte da 0R: il drawdown deve includere anche una partenza negativa.
+    peak = equity.cummax().clip(lower=0)
     drawdown = equity - peak
     max_dd = abs(float(drawdown.min())) if len(drawdown) else np.nan
 
@@ -1287,6 +1288,816 @@ def render_backtest_results(
         st.warning("\\n".join(errors))
 
 
+
+# ============================================================
+# V4 — OTTIMIZZATORE AUTOMATICO + WALK-FORWARD
+# ============================================================
+
+OPT_THRESHOLDS = [65, 70, 75, 80]
+OPT_ATR_PERIODS = [3, 5, 7, 10, 14, 20]
+OPT_STRENGTHS = ["MEDIO+", "BUONO+", "SOLO BUONO", "SOLO FORTE"]
+OPT_STOPS = [0.30, 0.40, 0.50, 0.60, 0.75, 1.00]
+OPT_COVERAGE = 0.60
+
+
+def optimizer_strength_mask(values: pd.Series, label: str) -> pd.Series:
+    x = pd.to_numeric(values, errors="coerce")
+    if label == "MEDIO+":
+        return x >= 0.30
+    if label == "BUONO+":
+        return x >= 0.50
+    if label == "SOLO BUONO":
+        return (x >= 0.50) & (x < 0.75)
+    if label == "SOLO FORTE":
+        return x >= 0.75
+    return pd.Series(True, index=values.index)
+
+
+def build_optimizer_base(
+    universe: dict,
+    start_date: date,
+    end_date: date,
+    atr_periods: list[int],
+) -> tuple[pd.DataFrame, list]:
+    """
+    Costruisce una matrice base una sola volta.
+    La stagionalità è indipendente da threshold/ATR/stop e viene quindi
+    precalcolata per ogni asset/data una sola volta.
+    """
+    rows = []
+    errors = []
+    progress = st.progress(0)
+    status = st.empty()
+
+    items = list(universe.items())
+    total_assets = max(len(items), 1)
+    start_ts = pd.Timestamp(start_date)
+    end_ts = pd.Timestamp(end_date)
+    today_ts = pd.Timestamp(date.today())
+
+    for i, (name, ticker) in enumerate(items, start=1):
+        status.write(f"Ottimizzatore — preparo {name} ({ticker})…")
+        df = download_history(ticker)
+
+        if df.empty:
+            errors.append(f"{name} ({ticker}): dati daily non disponibili")
+            progress.progress(i / total_assets)
+            continue
+
+        # Lookup stagionale mese/giorno.
+        seasonal_lookup = {}
+        valid_ret = df.dropna(subset=["Return"])
+        for (month, day), grp in valid_ret.groupby(
+            [valid_ret.index.month, valid_ret.index.day]
+        ):
+            seasonal_lookup[(int(month), int(day))] = (
+                grp.index.year.to_numpy(dtype=int),
+                grp["Return"].to_numpy(dtype=float),
+            )
+
+        # ATR(T-1) per tutti i periodi della griglia.
+        prev_close = df["Close"].shift(1)
+        tr = pd.concat(
+            [
+                df["High"] - df["Low"],
+                (df["High"] - prev_close).abs(),
+                (df["Low"] - prev_close).abs(),
+            ],
+            axis=1,
+        ).max(axis=1)
+
+        atr_maps = {}
+        for p in atr_periods:
+            atr_maps[int(p)] = tr.rolling(
+                int(p), min_periods=int(p)
+            ).mean().shift(1)
+
+        trade_index = df.index[
+            (df.index >= start_ts)
+            & (df.index <= end_ts)
+            & (df.index < today_ts)
+        ]
+
+        for dt in trade_index:
+            d = dt.date()
+            stats = {
+                w: fast_window_stats(seasonal_lookup, d, w)
+                for w in WINDOWS
+            }
+
+            avg_returns = [
+                stats[10]["avg"],
+                stats[15]["avg"],
+                stats[20]["avg"],
+            ]
+            if all(not pd.isna(x) for x in avg_returns):
+                target_pct = abs(float(np.median(avg_returns)))
+            else:
+                target_pct = np.nan
+
+            row = {
+                "Date": d,
+                "Asset": name,
+                "Ticker": ticker,
+                "Open": float(df.at[dt, "Open"]) if not pd.isna(df.at[dt, "Open"]) else np.nan,
+                "High": float(df.at[dt, "High"]) if not pd.isna(df.at[dt, "High"]) else np.nan,
+                "Low": float(df.at[dt, "Low"]) if not pd.isna(df.at[dt, "Low"]) else np.nan,
+                "Close": float(df.at[dt, "Close"]) if not pd.isna(df.at[dt, "Close"]) else np.nan,
+                "Prev Close": float(prev_close.loc[dt]) if not pd.isna(prev_close.loc[dt]) else np.nan,
+                "Target %": target_pct,
+                "L10": stats[10]["long_prob"],
+                "L15": stats[15]["long_prob"],
+                "L20": stats[20]["long_prob"],
+                "S10": stats[10]["short_prob"],
+                "S15": stats[15]["short_prob"],
+                "S20": stats[20]["short_prob"],
+                "N10": stats[10]["n"],
+                "N15": stats[15]["n"],
+                "N20": stats[20]["n"],
+            }
+
+            for p in atr_periods:
+                v = atr_maps[int(p)].loc[dt]
+                row[f"ATR_{int(p)}"] = float(v) if not pd.isna(v) else np.nan
+
+            rows.append(row)
+
+        progress.progress(i / total_assets)
+
+    status.empty()
+    progress.empty()
+
+    base = pd.DataFrame(rows)
+    if not base.empty:
+        base = base.sort_values(["Date", "Asset"]).reset_index(drop=True)
+    return base, errors
+
+
+def optimizer_select_daily_trades(
+    base: pd.DataFrame,
+    threshold_pct: int,
+    atr_period: int,
+    strength: str,
+) -> pd.DataFrame:
+    """
+    Applica:
+    - copertura minima 60% fissa
+    - threshold stagionale
+    - forza movimento
+    - ranking ex-ante
+    - massimo 1 trade al giorno
+    """
+    if base.empty:
+        return pd.DataFrame()
+
+    x = base.copy()
+
+    # Copertura fissa 60% sulle tre finestre.
+    coverage_mask = (
+        (x["N10"] / 10 >= OPT_COVERAGE)
+        & (x["N15"] / 15 >= OPT_COVERAGE)
+        & (x["N20"] / 20 >= OPT_COVERAGE)
+    )
+    x = x[coverage_mask].copy()
+    if x.empty:
+        return x
+
+    th = float(threshold_pct) / 100.0
+
+    long_ok = (
+        (x["L10"] >= th)
+        & (x["L15"] >= th)
+        & (x["L20"] >= th)
+    )
+    short_ok = (
+        (x["S10"] >= th)
+        & (x["S15"] >= th)
+        & (x["S20"] >= th)
+    )
+
+    x["Bias"] = np.where(
+        long_ok & ~short_ok,
+        "LONG",
+        np.where(short_ok & ~long_ok, "SHORT", "—"),
+    )
+    x = x[x["Bias"].isin(["LONG", "SHORT"])].copy()
+    if x.empty:
+        return x
+
+    x["Score"] = np.where(
+        x["Bias"] == "LONG",
+        x[["L10", "L15", "L20"]].mean(axis=1),
+        x[["S10", "S15", "S20"]].mean(axis=1),
+    )
+
+    atr_col = f"ATR_{int(atr_period)}"
+    x["ATR pts"] = pd.to_numeric(x[atr_col], errors="coerce")
+    x["ATR %"] = x["ATR pts"] / x["Prev Close"]
+    x["Target/ATR"] = x["Target %"] / x["ATR %"]
+    x["Target pts"] = x["Target %"] * x["Prev Close"]
+
+    x = x[
+        optimizer_strength_mask(x["Target/ATR"], strength)
+        & x["ATR pts"].notna()
+        & (x["ATR pts"] > 0)
+        & x["Target pts"].notna()
+    ].copy()
+    if x.empty:
+        return x
+
+    # Ranking noto prima dell'entry.
+    daily_counts = x.groupby("Date").size()
+    x["Candidati giorno"] = x["Date"].map(daily_counts)
+
+    x = x.sort_values(
+        ["Date", "Target/ATR", "Score", "Asset"],
+        ascending=[True, False, False, True],
+    )
+    x["Rank giorno"] = x.groupby("Date").cumcount() + 1
+    x = x[x["Rank giorno"] == 1].copy()
+
+    x["Threshold"] = int(threshold_pct)
+    x["ATR period"] = int(atr_period)
+    x["Forza"] = strength
+
+    return x.reset_index(drop=True)
+
+
+def optimizer_evaluate_stop(
+    selected: pd.DataFrame,
+    stop_atr: float,
+    start_date: date | None = None,
+    end_date: date | None = None,
+) -> pd.DataFrame:
+    """
+    Valuta il trade su OHLC daily.
+
+    Per l'ottimizzatore i casi in cui Target e Stop risultano entrambi
+    toccati nella stessa seduta sono sempre NO DATI. Questo evita migliaia
+    di download intraday e, soprattutto, non inventa l'ordine degli eventi.
+    La configurazione finale va poi verificata col backtest manuale.
+    """
+    if selected is None or selected.empty:
+        return pd.DataFrame()
+
+    x = selected.copy()
+
+    if start_date is not None:
+        x = x[x["Date"] >= start_date].copy()
+    if end_date is not None:
+        x = x[x["Date"] <= end_date].copy()
+    if x.empty:
+        return x
+
+    sl = float(stop_atr) * x["ATR pts"]
+    long_mask = x["Bias"] == "LONG"
+
+    target_level = np.where(
+        long_mask,
+        x["Open"] + x["Target pts"],
+        x["Open"] - x["Target pts"],
+    )
+    stop_level = np.where(
+        long_mask,
+        x["Open"] - sl,
+        x["Open"] + sl,
+    )
+
+    hit_target = np.where(
+        long_mask,
+        x["High"] >= target_level,
+        x["Low"] <= target_level,
+    )
+    hit_stop = np.where(
+        long_mask,
+        x["Low"] <= stop_level,
+        x["High"] >= stop_level,
+    )
+
+    both = hit_target & hit_stop
+    target_only = hit_target & ~hit_stop
+    stop_only = hit_stop & ~hit_target
+    neither = ~hit_target & ~hit_stop
+
+    r = np.full(len(x), np.nan, dtype=float)
+    r[target_only] = (
+        x.loc[target_only, "Target pts"].to_numpy(dtype=float)
+        / sl.loc[target_only].to_numpy(dtype=float)
+    )
+    r[stop_only] = -1.0
+
+    close_r = np.where(
+        long_mask,
+        (x["Close"] - x["Open"]) / sl,
+        (x["Open"] - x["Close"]) / sl,
+    )
+    r[neither] = close_r[neither]
+
+    outcome = np.full(len(x), "NO DATI", dtype=object)
+    outcome[target_only] = "WIN"
+    outcome[stop_only] = "LOSS"
+    outcome[neither & (r > 0)] = "WIN"
+    outcome[neither & (r < 0)] = "LOSS"
+    outcome[neither & (r == 0)] = "FLAT"
+    outcome[both] = "NO DATI"
+
+    exit_reason = np.full(len(x), "NO DATI", dtype=object)
+    exit_reason[target_only] = "TARGET"
+    exit_reason[stop_only] = "STOP"
+    exit_reason[neither] = "CLOSE"
+
+    x["SL pts"] = sl
+    x["R"] = r
+    x["Outcome"] = outcome
+    x["Exit reason"] = exit_reason
+    x["Stop ATR"] = float(stop_atr)
+
+    return x
+
+
+def optimizer_metrics(trades: pd.DataFrame) -> dict:
+    if trades is None or trades.empty:
+        return {
+            "signals": 0,
+            "valid": 0,
+            "no_data": 0,
+            "wins": 0,
+            "losses": 0,
+            "win_rate": np.nan,
+            "profit_factor": np.nan,
+            "expectancy_r": np.nan,
+            "total_r": np.nan,
+            "max_dd_r": np.nan,
+            "positive_year_ratio": np.nan,
+            "positive_years": 0,
+            "years": 0,
+        }
+
+    valid = trades.dropna(subset=["R"]).copy()
+    no_data = int(trades["R"].isna().sum())
+
+    if valid.empty:
+        return {
+            "signals": len(trades),
+            "valid": 0,
+            "no_data": no_data,
+            "wins": 0,
+            "losses": 0,
+            "win_rate": np.nan,
+            "profit_factor": np.nan,
+            "expectancy_r": np.nan,
+            "total_r": np.nan,
+            "max_dd_r": np.nan,
+            "positive_year_ratio": np.nan,
+            "positive_years": 0,
+            "years": 0,
+        }
+
+    valid = valid.sort_values(["Date", "Asset"]).copy()
+    wins = int((valid["R"] > 0).sum())
+    losses = int((valid["R"] < 0).sum())
+    decisive = wins + losses
+
+    gross_profit = float(valid.loc[valid["R"] > 0, "R"].sum())
+    gross_loss = abs(float(valid.loc[valid["R"] < 0, "R"].sum()))
+    pf = gross_profit / gross_loss if gross_loss > 0 else np.inf if gross_profit > 0 else np.nan
+
+    equity = valid["R"].cumsum()
+    peak = equity.cummax().clip(lower=0)
+    dd = equity - peak
+    max_dd = abs(float(dd.min())) if len(dd) else np.nan
+
+    yearly = valid.copy()
+    yearly["Year"] = pd.to_datetime(yearly["Date"]).dt.year
+    yearly_r = yearly.groupby("Year")["R"].sum()
+    years = int(len(yearly_r))
+    positive_years = int((yearly_r > 0).sum())
+
+    return {
+        "signals": len(trades),
+        "valid": len(valid),
+        "no_data": no_data,
+        "wins": wins,
+        "losses": losses,
+        "win_rate": wins / decisive if decisive > 0 else np.nan,
+        "profit_factor": pf,
+        "expectancy_r": float(valid["R"].mean()),
+        "total_r": float(valid["R"].sum()),
+        "max_dd_r": max_dd,
+        "positive_year_ratio": positive_years / years if years > 0 else np.nan,
+        "positive_years": positive_years,
+        "years": years,
+    }
+
+
+def optimizer_metric_row(
+    selected: pd.DataFrame,
+    stop_atr: float,
+    threshold: int,
+    atr_period: int,
+    strength: str,
+    start_date: date,
+    end_date: date,
+) -> tuple[dict, pd.DataFrame]:
+    trades = optimizer_evaluate_stop(
+        selected=selected,
+        stop_atr=stop_atr,
+        start_date=start_date,
+        end_date=end_date,
+    )
+    m = optimizer_metrics(trades)
+
+    row = {
+        "Filtro %": int(threshold),
+        "ATR": int(atr_period),
+        "Forza": strength,
+        "Stop ATR": float(stop_atr),
+        "Trade": m["valid"],
+        "NO DATI": m["no_data"],
+        "Win Rate": m["win_rate"],
+        "Profit Factor": m["profit_factor"],
+        "Expectancy R": m["expectancy_r"],
+        "Totale R": m["total_r"],
+        "Max DD R": m["max_dd_r"],
+        "Anni +": m["positive_years"],
+        "Anni": m["years"],
+        "% anni +": m["positive_year_ratio"],
+        "R/DD": (
+            m["total_r"] / m["max_dd_r"]
+            if not pd.isna(m["total_r"])
+            and not pd.isna(m["max_dd_r"])
+            and m["max_dd_r"] > 0
+            else np.nan
+        ),
+    }
+    return row, trades
+
+
+def run_optimizer_walkforward(
+    universe: dict,
+    start_date: date,
+    end_date: date,
+    train_years: int,
+    min_train_trades: int,
+    min_train_pf: float,
+    min_positive_year_ratio: float,
+) -> tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame, pd.DataFrame, list]:
+    """
+    1) Precalcola i candidati per 96 combinazioni:
+       threshold × ATR × forza.
+    2) Applica i 6 stop => 576 configurazioni.
+    3) Mostra classifica full-period SOLO esplorativa.
+    4) Walk-forward rolling: N anni train -> anno successivo OOS.
+    """
+    base, errors = build_optimizer_base(
+        universe=universe,
+        start_date=start_date,
+        end_date=end_date,
+        atr_periods=OPT_ATR_PERIODS,
+    )
+    if base.empty:
+        return pd.DataFrame(), pd.DataFrame(), pd.DataFrame(), pd.DataFrame(), errors
+
+    status = st.empty()
+    progress = st.progress(0)
+
+    # 96 selezioni giornaliere, riusate per tutti gli stop e tutti i fold.
+    selected_cache = {}
+    signal_configs = [
+        (th, atr, strength)
+        for th in OPT_THRESHOLDS
+        for atr in OPT_ATR_PERIODS
+        for strength in OPT_STRENGTHS
+    ]
+
+    for i, (th, atr, strength) in enumerate(signal_configs, start=1):
+        status.write(
+            f"Ottimizzatore — segnali {i}/{len(signal_configs)} "
+            f"(Filtro {th} · ATR{atr} · {strength})"
+        )
+        selected_cache[(th, atr, strength)] = optimizer_select_daily_trades(
+            base=base,
+            threshold_pct=th,
+            atr_period=atr,
+            strength=strength,
+        )
+        progress.progress(0.25 * i / len(signal_configs))
+
+    # Classifica full-period.
+    full_rows = []
+    total_full = len(signal_configs) * len(OPT_STOPS)
+    count = 0
+    for th, atr, strength in signal_configs:
+        selected = selected_cache[(th, atr, strength)]
+        for stop in OPT_STOPS:
+            count += 1
+            row, _ = optimizer_metric_row(
+                selected=selected,
+                stop_atr=stop,
+                threshold=th,
+                atr_period=atr,
+                strength=strength,
+                start_date=start_date,
+                end_date=end_date,
+            )
+            full_rows.append(row)
+            if count % 20 == 0 or count == total_full:
+                status.write(
+                    f"Ottimizzatore — classifica full-period {count}/{total_full}"
+                )
+                progress.progress(0.25 + 0.25 * count / total_full)
+
+    full_df = pd.DataFrame(full_rows)
+
+    # Walk-forward rolling per anno.
+    start_year = start_date.year
+    end_year = end_date.year
+    test_years = list(range(start_year + int(train_years), end_year + 1))
+
+    fold_rows = []
+    oos_trade_frames = []
+    chosen_rows = []
+
+    total_folds = max(len(test_years), 1)
+
+    for fold_i, test_year in enumerate(test_years, start=1):
+        train_start_year = test_year - int(train_years)
+        train_start = max(start_date, date(train_start_year, 1, 1))
+        train_end = min(end_date, date(test_year - 1, 12, 31))
+        test_start = max(start_date, date(test_year, 1, 1))
+        test_end = min(end_date, date(test_year, 12, 31))
+
+        if train_start > train_end or test_start > test_end:
+            continue
+
+        status.write(
+            f"Walk-forward {fold_i}/{total_folds}: "
+            f"train {train_start.year}-{train_end.year} → test {test_year}"
+        )
+
+        train_candidates = []
+
+        for th, atr, strength in signal_configs:
+            selected = selected_cache[(th, atr, strength)]
+            for stop in OPT_STOPS:
+                row, _ = optimizer_metric_row(
+                    selected=selected,
+                    stop_atr=stop,
+                    threshold=th,
+                    atr_period=atr,
+                    strength=strength,
+                    start_date=train_start,
+                    end_date=train_end,
+                )
+                train_candidates.append(row)
+
+        train_df = pd.DataFrame(train_candidates)
+
+        eligible = train_df[
+            (train_df["Trade"] >= int(min_train_trades))
+            & (train_df["Profit Factor"] >= float(min_train_pf))
+            & (train_df["Expectancy R"] > 0)
+            & (train_df["% anni +"] >= float(min_positive_year_ratio))
+        ].copy()
+
+        selection_rule = "criteri completi"
+
+        # Fallback trasparente se nessuna configurazione supera tutti i criteri.
+        if eligible.empty:
+            eligible = train_df[
+                (train_df["Trade"] >= int(min_train_trades))
+                & (train_df["Expectancy R"] > 0)
+            ].copy()
+            selection_rule = "fallback: trade minimi + expectancy positiva"
+
+        if eligible.empty:
+            eligible = train_df[
+                train_df["Trade"] >= max(10, int(min_train_trades // 2))
+            ].copy()
+            selection_rule = "fallback: campione minimo ridotto"
+
+        if eligible.empty:
+            continue
+
+        # Ranking trasparente:
+        # 1 expectancy
+        # 2 PF
+        # 3 DD più basso
+        # 4 più trade
+        eligible = eligible.sort_values(
+            ["Expectancy R", "Profit Factor", "Max DD R", "Trade"],
+            ascending=[False, False, True, False],
+        )
+
+        best = eligible.iloc[0]
+        key = (
+            int(best["Filtro %"]),
+            int(best["ATR"]),
+            str(best["Forza"]),
+        )
+        stop = float(best["Stop ATR"])
+        selected = selected_cache[key]
+
+        test_row, test_trades = optimizer_metric_row(
+            selected=selected,
+            stop_atr=stop,
+            threshold=key[0],
+            atr_period=key[1],
+            strength=key[2],
+            start_date=test_start,
+            end_date=test_end,
+        )
+
+        if not test_trades.empty:
+            test_trades = test_trades.copy()
+            test_trades["Test Year"] = test_year
+            oos_trade_frames.append(test_trades)
+
+        fold_rows.append({
+            "Train": f"{train_start.year}-{train_end.year}",
+            "Test": int(test_year),
+            "Filtro %": key[0],
+            "ATR": key[1],
+            "Forza": key[2],
+            "Stop ATR": stop,
+            "Regola selezione": selection_rule,
+            "Train Trade": int(best["Trade"]),
+            "Train PF": best["Profit Factor"],
+            "Train Exp R": best["Expectancy R"],
+            "Train DD R": best["Max DD R"],
+            "Train % anni +": best["% anni +"],
+            "Test Trade": int(test_row["Trade"]),
+            "Test NO DATI": int(test_row["NO DATI"]),
+            "Test Win Rate": test_row["Win Rate"],
+            "Test PF": test_row["Profit Factor"],
+            "Test Exp R": test_row["Expectancy R"],
+            "Test Tot R": test_row["Totale R"],
+            "Test DD R": test_row["Max DD R"],
+        })
+
+        chosen_rows.append({
+            "Filtro %": key[0],
+            "ATR": key[1],
+            "Forza": key[2],
+            "Stop ATR": stop,
+        })
+
+        progress.progress(0.50 + 0.50 * fold_i / total_folds)
+
+    status.empty()
+    progress.empty()
+
+    folds_df = pd.DataFrame(fold_rows)
+    chosen_df = pd.DataFrame(chosen_rows)
+
+    if oos_trade_frames:
+        oos_trades = pd.concat(oos_trade_frames, ignore_index=True)
+        oos_trades = oos_trades.sort_values(["Date", "Asset"]).reset_index(drop=True)
+    else:
+        oos_trades = pd.DataFrame()
+
+    return full_df, folds_df, chosen_df, oos_trades, errors
+
+
+def render_optimizer_results(
+    full_df: pd.DataFrame,
+    folds_df: pd.DataFrame,
+    chosen_df: pd.DataFrame,
+    oos_trades: pd.DataFrame,
+    errors: list,
+):
+    st.header("⚙️ Ottimizzatore automatico + Walk-Forward")
+
+    st.caption(
+        "Griglia fissa: 4 filtri stagionali × 6 ATR × 4 classi Forza × "
+        "6 Stop = **576 configurazioni**. Regole fisse: 1 trade/giorno, "
+        "copertura campione 60%, LONG+SHORT, regime SPX OFF."
+    )
+
+    if full_df.empty:
+        st.warning("L'ottimizzatore non ha prodotto risultati.")
+        if errors:
+            st.warning("\\n".join(errors))
+        return
+
+    # ---------------- Full period, solo esplorativo ----------------
+    st.subheader("Top configurazioni full-period — esplorativo")
+    st.warning(
+        "Questa tabella usa tutto il periodo e quindi è IN-SAMPLE. "
+        "Non va usata da sola per scegliere la strategia."
+    )
+
+    top = full_df[
+        (full_df["Trade"] >= 50)
+        & full_df["Expectancy R"].notna()
+    ].copy()
+
+    if top.empty:
+        top = full_df.copy()
+
+    top = top.sort_values(
+        ["Expectancy R", "Profit Factor", "Max DD R", "Trade"],
+        ascending=[False, False, True, False],
+    ).head(20)
+
+    top_disp = top.copy()
+    top_disp["Win Rate"] = top_disp["Win Rate"].map(
+        lambda x: "n/d" if pd.isna(x) else f"{x:.1%}"
+    )
+    top_disp["% anni +"] = top_disp["% anni +"].map(
+        lambda x: "n/d" if pd.isna(x) else f"{x:.0%}"
+    )
+    for c in ["Profit Factor", "Expectancy R", "Totale R", "Max DD R", "R/DD"]:
+        top_disp[c] = top_disp[c].map(
+            lambda x: "n/d" if pd.isna(x) else ("∞" if np.isinf(x) else f"{x:.2f}")
+        )
+    top_disp["Stop ATR"] = top_disp["Stop ATR"].map(lambda x: f"{x:.2f}")
+    st.dataframe(top_disp, width="stretch", hide_index=True)
+
+    # ---------------- Walk-forward ----------------
+    st.subheader("Walk-Forward — risultati fuori campione")
+
+    if folds_df.empty:
+        st.warning("Nessun fold Walk-Forward disponibile con il periodo selezionato.")
+        return
+
+    fold_disp = folds_df.copy()
+    for c in ["Train PF", "Train Exp R", "Train DD R", "Test PF", "Test Exp R", "Test Tot R", "Test DD R"]:
+        fold_disp[c] = fold_disp[c].map(
+            lambda x: "n/d" if pd.isna(x) else ("∞" if np.isinf(x) else f"{x:.2f}")
+        )
+    for c in ["Train % anni +", "Test Win Rate"]:
+        fold_disp[c] = fold_disp[c].map(
+            lambda x: "n/d" if pd.isna(x) else f"{x:.1%}"
+        )
+    fold_disp["Stop ATR"] = fold_disp["Stop ATR"].map(lambda x: f"{x:.2f}")
+    st.dataframe(fold_disp, width="stretch", hide_index=True)
+
+    # ---------------- OOS aggregate ----------------
+    oos = optimizer_metrics(oos_trades)
+    positive_test_years = 0
+    total_test_years = 0
+    if not oos_trades.empty:
+        tmp = oos_trades.dropna(subset=["R"]).copy()
+        if not tmp.empty:
+            tmp["Year"] = pd.to_datetime(tmp["Date"]).dt.year
+            yr = tmp.groupby("Year")["R"].sum()
+            positive_test_years = int((yr > 0).sum())
+            total_test_years = int(len(yr))
+
+    st.subheader("Aggregato OUT-OF-SAMPLE")
+    c1, c2, c3, c4, c5, c6, c7 = st.columns(7)
+    c1.metric("Trade OOS", oos["valid"])
+    c2.metric("NO DATI", oos["no_data"])
+    c3.metric("Win Rate", "n/d" if pd.isna(oos["win_rate"]) else f"{oos['win_rate']:.1%}")
+    c4.metric("Profit Factor", format_metric(oos["profit_factor"]))
+    c5.metric("Expectancy", "n/d" if pd.isna(oos["expectancy_r"]) else f"{oos['expectancy_r']:+.3f} R")
+    c6.metric("Totale", "n/d" if pd.isna(oos["total_r"]) else f"{oos['total_r']:+.2f} R")
+    c7.metric("Max DD", "n/d" if pd.isna(oos["max_dd_r"]) else f"{oos['max_dd_r']:.2f} R")
+
+    if total_test_years > 0:
+        st.caption(
+            f"Anni OOS positivi: **{positive_test_years}/{total_test_years} "
+            f"({positive_test_years / total_test_years:.0%})**."
+        )
+
+    # Equity OOS
+    valid_oos = oos_trades.dropna(subset=["R"]).copy() if not oos_trades.empty else pd.DataFrame()
+    if not valid_oos.empty:
+        valid_oos = valid_oos.sort_values(["Date", "Asset"])
+        daily = valid_oos.groupby("Date", as_index=False)["R"].sum()
+        daily["Equity OOS R"] = daily["R"].cumsum()
+        st.subheader("Equity OUT-OF-SAMPLE in R")
+        st.line_chart(daily.set_index("Date")["Equity OOS R"])
+
+    # Stabilità parametri scelti
+    if not chosen_df.empty:
+        st.subheader("Stabilità dei parametri scelti nei fold")
+        stability = []
+        for col in ["Filtro %", "ATR", "Forza", "Stop ATR"]:
+            counts = chosen_df[col].value_counts(dropna=False)
+            for value, count in counts.items():
+                stability.append({
+                    "Parametro": col,
+                    "Valore": value,
+                    "Fold": int(count),
+                    "% fold": count / len(chosen_df),
+                })
+        stab = pd.DataFrame(stability)
+        stab["% fold"] = stab["% fold"].map(lambda x: f"{x:.0%}")
+        st.dataframe(stab, width="stretch", hide_index=True)
+
+    st.info(
+        "Interpretazione: la tabella full-period serve solo a capire dove sono "
+        "le zone interessanti. Il dato decisivo è l'OUT-OF-SAMPLE Walk-Forward. "
+        "Se i parametri cambiano radicalmente a ogni fold o l'OOS non resta positivo, "
+        "l'ottimizzazione non è robusta."
+    )
+
+    if errors:
+        st.warning("\\n".join(errors))
+
+
 def parse_universe_text(text: str) -> tuple[dict, list]:
     """
     Formati accettati:
@@ -1462,8 +2273,63 @@ with st.sidebar:
 
     run_backtest = st.button("Esegui backtest", type="secondary", width="stretch")
     st.caption(
-        "Motore V3.5 ottimizzato: storici, ATR, stagionalità ed EMA SPX "
+        "Motore V4 ottimizzato: storici, ATR, stagionalità ed EMA SPX "
         "vengono precalcolati e riutilizzati durante il backtest."
+    )
+
+    st.divider()
+    st.subheader("Ottimizzatore automatico")
+
+    opt_start = st.date_input(
+        "Data inizio ottimizzazione",
+        value=date(2019, 1, 1),
+        key="opt_start",
+    )
+    opt_end = st.date_input(
+        "Data fine ottimizzazione",
+        value=date.today(),
+        key="opt_end",
+        help="La seduta odierna incompleta viene esclusa automaticamente.",
+    )
+    opt_train_years = st.number_input(
+        "Anni training Walk-Forward",
+        min_value=2,
+        max_value=5,
+        value=3,
+        step=1,
+    )
+    opt_min_train_trades = st.number_input(
+        "Min trade nel training",
+        min_value=10,
+        max_value=200,
+        value=30,
+        step=5,
+    )
+    opt_min_train_pf = st.number_input(
+        "Min Profit Factor training",
+        min_value=0.90,
+        max_value=2.00,
+        value=1.05,
+        step=0.05,
+        format="%.2f",
+    )
+    opt_min_positive_years_pct = st.slider(
+        "Min % anni positivi training",
+        min_value=0,
+        max_value=100,
+        value=50,
+        step=10,
+    )
+
+    run_optimizer = st.button(
+        "Ottimizza + Walk-Forward",
+        type="secondary",
+        width="stretch",
+    )
+    st.caption(
+        "Griglia: filtro 65/70/75/80 · ATR 3/5/7/10/14/20 · "
+        "MEDIO+/BUONO+/SOLO BUONO/SOLO FORTE · Stop 0.30/0.40/0.50/0.60/0.75/1.00. "
+        "Fissi: 1 trade/giorno, copertura 60%, SPX OFF."
     )
 
     st.divider()
@@ -1518,6 +2384,57 @@ st.info(
     "quell'anno viene escluso dal campione. Esempio: l'11 agosto viene confrontato "
     "solo con gli 11 agosto che sono stati effettive sedute di borsa."
 )
+
+# Se è stato richiesto l'ottimizzatore, usa lo stesso universo selezionato.
+if run_optimizer:
+    if opt_start > opt_end:
+        st.error("La data iniziale dell'ottimizzazione deve precedere la data finale.")
+        st.stop()
+
+    if uploaded_universe is None:
+        opt_universe = DEFAULT_UNIVERSE.copy()
+        opt_bad_rows = []
+        opt_universe_source = "predefinito"
+    else:
+        uploaded_text = decode_uploaded_txt(uploaded_universe)
+        opt_universe, opt_bad_rows = parse_universe_text(uploaded_text)
+        opt_universe_source = uploaded_universe.name
+
+    if opt_bad_rows:
+        st.error("Righe universo non valide: " + " | ".join(opt_bad_rows))
+        st.stop()
+
+    if not opt_universe:
+        st.error("Nessun asset valido nell'universo selezionato.")
+        st.stop()
+
+    st.info(
+        f"Ottimizzazione: **{opt_start} → {opt_end}** · "
+        f"Training rolling **{int(opt_train_years)} anni** · "
+        f"Min trade train **{int(opt_min_train_trades)}** · "
+        f"Min PF train **{opt_min_train_pf:.2f}** · "
+        f"Min anni positivi **{opt_min_positive_years_pct}%** · "
+        f"Universo **{opt_universe_source}**"
+    )
+
+    opt_full, opt_folds, opt_chosen, opt_oos, opt_errors = run_optimizer_walkforward(
+        universe=opt_universe,
+        start_date=opt_start,
+        end_date=opt_end,
+        train_years=int(opt_train_years),
+        min_train_trades=int(opt_min_train_trades),
+        min_train_pf=float(opt_min_train_pf),
+        min_positive_year_ratio=opt_min_positive_years_pct / 100,
+    )
+
+    render_optimizer_results(
+        full_df=opt_full,
+        folds_df=opt_folds,
+        chosen_df=opt_chosen,
+        oos_trades=opt_oos,
+        errors=opt_errors,
+    )
+    st.stop()
 
 # Se è stato richiesto il backtest, usa lo stesso universo selezionato.
 if run_backtest:

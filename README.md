@@ -375,3 +375,56 @@ Ottimizzazioni:
 
 La V3.5 è pensata per backtest pluriennali e prepara il motore per il futuro
 ottimizzatore automatico.
+
+
+## V4.0 — Ottimizzatore automatico + Walk-Forward
+
+### Griglia automatica
+
+- filtro stagionale: 65 / 70 / 75 / 80
+- ATR: 3 / 5 / 7 / 10 / 14 / 20
+- Forza: MEDIO+ / BUONO+ / SOLO BUONO / SOLO FORTE
+- Stop ATR: 0,30 / 0,40 / 0,50 / 0,60 / 0,75 / 1,00
+
+Totale: 576 configurazioni.
+
+### Regole fisse nell'optimizer
+
+- massimo 1 trade al giorno
+- copertura minima campione 60%
+- LONG + SHORT
+- regime S&P 500 OFF
+- ranking giornaliero: Target/ATR, poi Score
+- casi target+stop entrambi toccati sul daily = NO DATI nell'optimizer
+  (la configurazione finale va validata col backtest manuale)
+
+### Walk-Forward
+
+Default:
+- training rolling 3 anni
+- test sull'anno successivo
+- min 30 trade nel training
+- min Profit Factor training 1,05
+- min 50% anni positivi nel training
+
+La configurazione viene scelta ESCLUSIVAMENTE sul training.
+Il test successivo non influenza la scelta.
+
+Ranking training:
+1. Expectancy R più alta
+2. Profit Factor più alto
+3. Max Drawdown più basso
+4. maggior numero di trade
+
+### Output
+
+- Top configurazioni full-period (solo esplorativo / in-sample)
+- tabella fold Walk-Forward
+- aggregato OUT-OF-SAMPLE
+- equity OOS in R
+- stabilità dei parametri scelti tra i fold
+
+### Correzione Max Drawdown
+
+Dalla V4 il Max Drawdown include correttamente l'equity iniziale pari a 0R,
+quindi una partenza negativa viene conteggiata come drawdown.
