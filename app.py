@@ -2058,11 +2058,11 @@ def build_optimizer_excel_report(
             for c, col in enumerate(df_sheet.columns):
                 ws.write(0, c, col, header_fmt)
                 sample = (
-                    df_sheet[col].astype(str).head(250).tolist()
+                    [str(v) for v in df_sheet[col].head(250).tolist()]
                     if len(df_sheet)
                     else []
                 )
-                max_len = max([len(str(col))] + [len(v) for v in sample])
+                max_len = max([len(str(col))] + [len(str(v)) for v in sample])
                 width = min(max(max_len + 2, 11), 28)
 
                 col_name = str(col)
@@ -2114,8 +2114,12 @@ def build_optimizer_excel_report(
                 "Profit Factor OOS",
                 "Totale OOS (R)",
                 "Max Drawdown OOS (R)",
-            } and pd.notna(summary_df.iloc[row_idx - 1, 1]) and not np.isinf(summary_df.iloc[row_idx - 1, 1]):
-                ws.write_number(row_idx, 1, float(summary_df.iloc[row_idx - 1, 1]), num2_fmt)
+            } and pd.notna(summary_df.iloc[row_idx - 1, 1]):
+                value = summary_df.iloc[row_idx - 1, 1]
+                if np.isinf(value):
+                    ws.write(row_idx, 1, "∞")
+                else:
+                    ws.write_number(row_idx, 1, float(value), num2_fmt)
 
     output.seek(0)
     return output.getvalue()

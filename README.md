@@ -445,3 +445,13 @@ Il file `.xlsx` contiene:
 
 È il file da allegare in chat per analizzare il risultato completo senza
 dipendere da screenshot parziali.
+
+
+## V4.2 — fix export Excel
+
+Corretto il TypeError durante la creazione del file Excel:
+- i valori usati per calcolare la larghezza delle colonne vengono ora sempre convertiti in stringa;
+- gestione più robusta dei tipi pandas/numpy;
+- gestione esplicita dei valori infiniti nel riepilogo OOS.
+
+La logica di scanner, backtest, ottimizzatore e Walk-Forward è invariata.
