@@ -497,6 +497,8 @@ with st.sidebar:
              "Serve solo per valutare la dimensione del target rispetto alla volatilità recente."
     )
 
+    run = st.button("Analizza settimana", type="primary", width="stretch")
+
     st.divider()
     st.subheader("Universo")
 
@@ -541,7 +543,6 @@ with st.sidebar:
         "continuous futures Yahoo."
     )
 
-    run = st.button("Analizza settimana", type="primary", width="stretch")
 
 st.info(
     "**Metodo Forecaster:** per ogni giornata futura viene usato lo stesso "

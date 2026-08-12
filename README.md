@@ -228,3 +228,9 @@ Sono esclusi dal calcolo:
 - PENDING
 - AMBIGUO
 - N/D
+
+
+## V2.2 — posizione pulsante
+
+Il pulsante `Analizza settimana` è stato spostato subito sotto il controllo
+`ATR periodi per forza movimento`, prima della sezione Universo.
