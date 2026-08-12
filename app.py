@@ -632,10 +632,20 @@ res = pd.DataFrame([{k: v for k, v in r.items() if k != "_samples"} for r in res
 opps = res[res["Bias"] != "—"].copy()
 opps = opps.sort_values(["Date", "Score"], ascending=[True, False])
 
-c1, c2, c3 = st.columns(3)
+# Metriche riepilogative
+win_count = int((opps["Esito"] == "WIN").sum()) if "Esito" in opps.columns else 0
+loss_count = int((opps["Esito"] == "LOSS").sum()) if "Esito" in opps.columns else 0
+closed_count = win_count + loss_count
+win_rate = (win_count / closed_count) if closed_count > 0 else np.nan
+
+c1, c2, c3, c4, c5, c6 = st.columns(6)
 c1.metric("Sedute analizzate", len(targets))
 c2.metric("Asset analizzati", len(universe), help=f"Fonte universo: {universe_source}")
 c3.metric("Opportunità valide", len(opps))
+c4.metric("WIN", win_count)
+c5.metric("LOSS", loss_count)
+c6.metric("Win Rate", "n/d" if pd.isna(win_rate) else f"{win_rate:.1%}",
+          help="WIN / (WIN + LOSS). NO HIT, PENDING e AMBIGUO sono esclusi.")
 
 st.subheader("Opportunità della settimana")
 

@@ -212,3 +212,19 @@ Esiti:
 Quando Daily High/Low toccano entrambi i livelli, l'app prova le barre 5 minuti per stabilire quale sia stato raggiunto prima. Se entrambi risultano toccati nella stessa barra 5m o l'intraday non è disponibile, l'esito resta AMBIGUO.
 
 Nota: con Target = 25% ATR e Stop = 50% ATR, il break-even teorico è 66,7% prima di costi/slippage.
+
+
+## V2.1 — riepilogo WIN / LOSS / Win Rate
+
+A fianco delle metriche principali vengono mostrati:
+- WIN
+- LOSS
+- Win Rate
+
+Win Rate = WIN / (WIN + LOSS)
+
+Sono esclusi dal calcolo:
+- NO HIT
+- PENDING
+- AMBIGUO
+- N/D
