@@ -3,3 +3,4 @@ pandas>=2.2
 numpy>=2.0
 yfinance>=0.2.66
 pandas-market-calendars>=4.4
+xlsxwriter>=3.2

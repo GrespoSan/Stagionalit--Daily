@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from datetime import date, timedelta
+import io
 import math
 
 import numpy as np
@@ -1959,12 +1960,174 @@ def run_optimizer_walkforward(
     return full_df, folds_df, chosen_df, oos_trades, errors
 
 
+
+def build_optimizer_excel_report(
+    full_df: pd.DataFrame,
+    folds_df: pd.DataFrame,
+    chosen_df: pd.DataFrame,
+    oos_trades: pd.DataFrame,
+    settings: dict,
+) -> bytes:
+    """Crea un unico report Excel con tutti i dati dell'ottimizzazione."""
+    output = io.BytesIO()
+    oos = optimizer_metrics(oos_trades)
+
+    summary_df = pd.DataFrame(
+        [
+            ["Trade OOS", oos["valid"]],
+            ["NO DATI OOS", oos["no_data"]],
+            ["WIN OOS", oos["wins"]],
+            ["LOSS OOS", oos["losses"]],
+            ["Win Rate OOS", oos["win_rate"]],
+            ["Profit Factor OOS", oos["profit_factor"]],
+            ["Expectancy OOS (R)", oos["expectancy_r"]],
+            ["Totale OOS (R)", oos["total_r"]],
+            ["Max Drawdown OOS (R)", oos["max_dd_r"]],
+            ["Anni OOS positivi", oos["positive_years"]],
+            ["Anni OOS totali", oos["years"]],
+            ["% anni OOS positivi", oos["positive_year_ratio"]],
+        ],
+        columns=["Metrica", "Valore"],
+    )
+
+    settings_df = pd.DataFrame(
+        [{"Parametro": str(k), "Valore": str(v)} for k, v in settings.items()]
+    )
+
+    if not chosen_df.empty:
+        stability_rows = []
+        for col in ["Filtro %", "ATR", "Forza", "Stop ATR"]:
+            counts = chosen_df[col].value_counts(dropna=False)
+            for value, count in counts.items():
+                stability_rows.append(
+                    {
+                        "Parametro": col,
+                        "Valore": value,
+                        "Fold": int(count),
+                        "% fold": count / len(chosen_df),
+                    }
+                )
+        stability_df = pd.DataFrame(stability_rows)
+    else:
+        stability_df = pd.DataFrame(
+            columns=["Parametro", "Valore", "Fold", "% fold"]
+        )
+
+    with pd.ExcelWriter(output, engine="xlsxwriter") as writer:
+        datasets = [
+            ("Riepilogo_OOS", summary_df),
+            ("Impostazioni", settings_df),
+            ("Full_576", full_df),
+            ("Walk_Forward", folds_df),
+            ("Parametri_Scelti", chosen_df),
+            ("Stabilita", stability_df),
+            ("Trade_OOS", oos_trades),
+        ]
+
+        for sheet_name, df_sheet in datasets:
+            df_sheet.to_excel(writer, sheet_name=sheet_name, index=False)
+
+        workbook = writer.book
+        header_fmt = workbook.add_format(
+            {
+                "bold": True,
+                "font_color": "#FFFFFF",
+                "bg_color": "#1F4E78",
+                "border": 1,
+                "align": "center",
+                "valign": "vcenter",
+            }
+        )
+        pct_fmt = workbook.add_format({"num_format": "0.0%"})
+        num2_fmt = workbook.add_format({"num_format": "0.00"})
+        num3_fmt = workbook.add_format({"num_format": "0.000"})
+        date_fmt = workbook.add_format({"num_format": "yyyy-mm-dd"})
+
+        for sheet_name, df_sheet in datasets:
+            ws = writer.sheets[sheet_name]
+            ws.freeze_panes(1, 0)
+
+            if len(df_sheet.columns) > 0:
+                ws.autofilter(
+                    0,
+                    0,
+                    max(len(df_sheet), 1),
+                    len(df_sheet.columns) - 1,
+                )
+
+            for c, col in enumerate(df_sheet.columns):
+                ws.write(0, c, col, header_fmt)
+                sample = (
+                    df_sheet[col].astype(str).head(250).tolist()
+                    if len(df_sheet)
+                    else []
+                )
+                max_len = max([len(str(col))] + [len(v) for v in sample])
+                width = min(max(max_len + 2, 11), 28)
+
+                col_name = str(col)
+                cell_fmt = None
+                if (
+                    "Win Rate" in col_name
+                    or "% anni" in col_name
+                    or "% fold" in col_name
+                ):
+                    cell_fmt = pct_fmt
+                    width = max(width, 14)
+                elif col_name in {
+                    "Expectancy R",
+                    "Train Exp R",
+                    "Test Exp R",
+                }:
+                    cell_fmt = num3_fmt
+                    width = max(width, 14)
+                elif any(
+                    key in col_name
+                    for key in [
+                        "Profit Factor",
+                        "Totale R",
+                        "Max DD",
+                        "R/DD",
+                        "Stop ATR",
+                        "Train PF",
+                        "Test PF",
+                        "Train DD",
+                        "Test DD",
+                    ]
+                ):
+                    cell_fmt = num2_fmt
+                    width = max(width, 14)
+                elif col_name == "Date":
+                    cell_fmt = date_fmt
+                    width = max(width, 12)
+
+                ws.set_column(c, c, width, cell_fmt)
+
+        # Formattazione specifica del riepilogo.
+        ws = writer.sheets["Riepilogo_OOS"]
+        for row_idx, metric in enumerate(summary_df["Metrica"], start=1):
+            if metric in {"Win Rate OOS", "% anni OOS positivi"}:
+                ws.write_number(row_idx, 1, float(summary_df.iloc[row_idx - 1, 1]), pct_fmt)
+            elif metric == "Expectancy OOS (R)" and pd.notna(summary_df.iloc[row_idx - 1, 1]):
+                ws.write_number(row_idx, 1, float(summary_df.iloc[row_idx - 1, 1]), num3_fmt)
+            elif metric in {
+                "Profit Factor OOS",
+                "Totale OOS (R)",
+                "Max Drawdown OOS (R)",
+            } and pd.notna(summary_df.iloc[row_idx - 1, 1]) and not np.isinf(summary_df.iloc[row_idx - 1, 1]):
+                ws.write_number(row_idx, 1, float(summary_df.iloc[row_idx - 1, 1]), num2_fmt)
+
+    output.seek(0)
+    return output.getvalue()
+
+
 def render_optimizer_results(
     full_df: pd.DataFrame,
     folds_df: pd.DataFrame,
     chosen_df: pd.DataFrame,
     oos_trades: pd.DataFrame,
     errors: list,
+    settings: dict,
 ):
     st.header("⚙️ Ottimizzatore automatico + Walk-Forward")
 
@@ -2092,6 +2255,35 @@ def render_optimizer_results(
         "le zone interessanti. Il dato decisivo è l'OUT-OF-SAMPLE Walk-Forward. "
         "Se i parametri cambiano radicalmente a ogni fold o l'OOS non resta positivo, "
         "l'ottimizzazione non è robusta."
+    )
+
+    st.subheader("Esporta risultati")
+    excel_bytes = build_optimizer_excel_report(
+        full_df=full_df,
+        folds_df=folds_df,
+        chosen_df=chosen_df,
+        oos_trades=oos_trades,
+        settings=settings,
+    )
+
+    start_tag = str(settings.get("Data inizio", "start")).replace("/", "-")
+    end_tag = str(settings.get("Data fine", "end")).replace("/", "-")
+
+    st.download_button(
+        "📥 Scarica report ottimizzazione Excel",
+        data=excel_bytes,
+        file_name=f"seasonality_optimizer_{start_tag}_{end_tag}.xlsx",
+        mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+        type="primary",
+        width="stretch",
+        help=(
+            "Contiene tutte le 576 configurazioni, i fold Walk-Forward, "
+            "i parametri scelti, la stabilità e tutti i trade OUT-OF-SAMPLE."
+        ),
+    )
+    st.caption(
+        "Scarica questo file e allegalo in chat: contiene tutti i dati necessari "
+        "per analizzare l'ottimizzazione senza screenshot."
     )
 
     if errors:
@@ -2427,12 +2619,33 @@ if run_optimizer:
         min_positive_year_ratio=opt_min_positive_years_pct / 100,
     )
 
+    opt_export_settings = {
+        "Data inizio": opt_start,
+        "Data fine": opt_end,
+        "Training rolling anni": int(opt_train_years),
+        "Min trade training": int(opt_min_train_trades),
+        "Min Profit Factor training": float(opt_min_train_pf),
+        "Min % anni positivi training": f"{opt_min_positive_years_pct}%",
+        "Universo": opt_universe_source,
+        "Numero asset": len(opt_universe),
+        "Max trade/giorno": 1,
+        "Copertura minima campione": "60%",
+        "Direzione": "LONG + SHORT",
+        "Regime SPX": "OFF",
+        "Filtri stagionali testati": "65, 70, 75, 80",
+        "ATR testati": "3, 5, 7, 10, 14, 20",
+        "Forza testate": "MEDIO+, BUONO+, SOLO BUONO, SOLO FORTE",
+        "Stop ATR testati": "0.30, 0.40, 0.50, 0.60, 0.75, 1.00",
+        "Numero configurazioni": 576,
+    }
+
     render_optimizer_results(
         full_df=opt_full,
         folds_df=opt_folds,
         chosen_df=opt_chosen,
         oos_trades=opt_oos,
         errors=opt_errors,
+        settings=opt_export_settings,
     )
     st.stop()
 

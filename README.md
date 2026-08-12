@@ -428,3 +428,20 @@ Ranking training:
 
 Dalla V4 il Max Drawdown include correttamente l'equity iniziale pari a 0R,
 quindi una partenza negativa viene conteggiata come drawdown.
+
+
+## V4.1 — Export Excel completo
+
+Dopo l'ottimizzazione compare il pulsante `Scarica report ottimizzazione Excel`.
+
+Il file `.xlsx` contiene:
+- `Riepilogo_OOS`
+- `Impostazioni`
+- `Full_576` con tutte le configurazioni testate
+- `Walk_Forward`
+- `Parametri_Scelti`
+- `Stabilita`
+- `Trade_OOS`
+
+È il file da allegare in chat per analizzare il risultato completo senza
+dipendere da screenshot parziali.
