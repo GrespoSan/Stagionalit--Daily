@@ -306,3 +306,31 @@ Nel Trade Log vengono mostrate:
 - `Rank giorno`
 
 In questo modo è possibile verificare perché uno specifico trade è stato scelto.
+
+
+## V3.3 — Regime SPX e analisi annuale
+
+Modifiche:
+- massimo 1 trade al giorno fissato come regola strutturale;
+- rimosso il selettore 1/2/3/TUTTI;
+- nuovo filtro regime SP500:
+  - OFF
+  - SOLO SOPRA EMA
+  - SOLO SOTTO EMA
+- periodo EMA modificabile, default 21;
+- regime sempre calcolato su T-1, senza look-ahead;
+- nuova tabella `Risultati per anno` con:
+  - Segnali
+  - Valutabili
+  - NO DATI
+  - WIN / LOSS
+  - Win Rate
+  - Profit Factor
+  - Expectancy R
+  - Totale R
+  - Max DD R
+
+La priorità del trade giornaliero resta:
+1. Target/ATR più alto
+2. Score stagionale più alto
+3. nome asset come tie-break.

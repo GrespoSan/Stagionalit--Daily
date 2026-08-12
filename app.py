@@ -658,9 +658,8 @@ def run_manual_backtest(
     direction_filter: str,
     require_return_coherence: bool,
     min_sample_coverage: float,
-    use_spx_filter: bool,
+    spx_filter_mode: str,
     spx_ema_period: int,
-    max_trades_per_day: str,
 ) -> tuple[pd.DataFrame, list]:
     """
     Backtest day-by-day senza look-ahead.
@@ -716,7 +715,9 @@ def run_manual_backtest(
                 continue
 
             regime = spx_regime_before_date(spx_df, d, int(spx_ema_period))
-            if use_spx_filter and not regime["SPX Above EMA"]:
+            if spx_filter_mode == "SOLO SOPRA EMA" and not regime["SPX Above EMA"]:
+                continue
+            if spx_filter_mode == "SOLO SOTTO EMA" and regime["SPX Regime"] != "SOTTO EMA":
                 continue
 
             if direction_filter == "SOLO LONG" and sig["Bias"] != "LONG":
@@ -787,9 +788,8 @@ def run_manual_backtest(
     ).reset_index(drop=True)
     candidates["Rank giorno"] = candidates.groupby("Date").cumcount() + 1
 
-    if max_trades_per_day != "TUTTI":
-        max_n = int(max_trades_per_day)
-        candidates = candidates[candidates["Rank giorno"] <= max_n].copy()
+    # Regola fissa della strategia: massimo 1 trade al giorno.
+    candidates = candidates[candidates["Rank giorno"] <= 1].copy()
 
     # Solo ORA, dopo la selezione, calcoliamo l'esito del trade.
     evaluated = []
@@ -822,7 +822,14 @@ def format_metric(v, fmt=".2f"):
     return format(v, fmt)
 
 
-def render_backtest_results(bt: pd.DataFrame, errors: list, atr_period: int, stop_atr_mult: float, spx_ema_period: int, use_spx_filter: bool):
+def render_backtest_results(
+    bt: pd.DataFrame,
+    errors: list,
+    atr_period: int,
+    stop_atr_mult: float,
+    spx_ema_period: int,
+    spx_filter_mode: str,
+):
     st.header("🧪 Backtest manuale")
 
     if bt.empty:
@@ -883,7 +890,39 @@ def render_backtest_results(bt: pd.DataFrame, errors: list, atr_period: int, sto
         for c in ["Profit Factor", "Expectancy R", "Totale R", "Max DD R"]:
             rf[c] = rf[c].map(lambda x: "n/d" if pd.isna(x) else ("∞" if np.isinf(x) else f"{x:.2f}"))
         st.dataframe(rf, width="stretch", hide_index=True)
-    st.caption("Regime calcolato con Close SPX e EMA della seduta precedente (T−1). Con filtro attivo, sia LONG sia SHORT sono ammessi solo con SPX sopra EMA.")
+    st.caption(
+        f"Regime calcolato con Close SPX e EMA della seduta precedente (T−1). "
+        f"Filtro attivo: {spx_filter_mode}. La stessa regola vale sia per LONG sia per SHORT."
+    )
+
+    st.subheader("Risultati per anno")
+    yearly_rows = []
+    bt_year = bt.copy()
+    bt_year["Anno"] = pd.to_datetime(bt_year["Date"]).dt.year
+    for year, part in bt_year.groupby("Anno"):
+        mm = backtest_metrics(part)
+        yearly_rows.append({
+            "Anno": int(year),
+            "Segnali": mm["signals"],
+            "Valutabili": mm["valid"],
+            "NO DATI": mm["no_data"],
+            "WIN": mm["wins"],
+            "LOSS": mm["losses"],
+            "Win Rate": mm["win_rate"],
+            "Profit Factor": mm["profit_factor"],
+            "Expectancy R": mm["expectancy_r"],
+            "Totale R": mm["total_r"],
+            "Max DD R": mm["max_dd_r"],
+        })
+
+    if yearly_rows:
+        yf = pd.DataFrame(yearly_rows).sort_values("Anno")
+        yf["Win Rate"] = yf["Win Rate"].map(lambda x: "n/d" if pd.isna(x) else f"{x:.1%}")
+        for c in ["Profit Factor", "Expectancy R", "Totale R", "Max DD R"]:
+            yf[c] = yf[c].map(
+                lambda x: "n/d" if pd.isna(x) else ("∞" if np.isinf(x) else f"{x:.2f}")
+            )
+        st.dataframe(yf, width="stretch", hide_index=True)
 
     st.subheader("Risultati per forza movimento")
     strength_order = ["DEBOLE", "MEDIO", "BUONO", "FORTE"]
@@ -959,8 +998,8 @@ def render_backtest_results(bt: pd.DataFrame, errors: list, atr_period: int, sto
             "• Se né target né stop vengono raggiunti, il trade viene chiuso al Close.\\n"
             "• Se target e stop sono entrambi toccati nella stessa seduta e non possiamo "
             "stabilire l'ordine con dati intraday, l'esito è NO DATI e il trade non entra nelle metriche.\\n"
-            "• Il limite Max trade/giorno viene applicato prima di conoscere l'esito, "
-            "ordinando i candidati per Target/ATR e poi Score.\n"
+            "• La strategia usa sempre massimo 1 trade al giorno. La selezione viene applicata prima "
+            "di conoscere l'esito, ordinando i candidati per Target/ATR e poi Score.\n"
             "• La versione non applica ancora un limite di rischio complessivo tra giornate o correlazioni tra asset."
         )
 
@@ -1104,16 +1143,6 @@ with st.sidebar:
         ["LONG + SHORT", "SOLO LONG", "SOLO SHORT"],
         index=0,
     )
-    bt_max_trades_day = st.selectbox(
-        "Max trade per giorno",
-        ["1", "2", "3", "TUTTI"],
-        index=0,
-        help=(
-            "Se ci sono più segnali nello stesso giorno, vengono scelti prima "
-            "quelli con Target/ATR più alto e poi con Score stagionale più alto. "
-            "La selezione avviene prima di conoscere l'esito."
-        ),
-    )
     bt_coherence = st.checkbox(
         "Richiedi coerenza Bias / rendimento medio",
         value=False,
@@ -1129,10 +1158,14 @@ with st.sidebar:
     )
 
     st.markdown("**Regime S&P 500**")
-    bt_spx_filter = st.checkbox(
-        "Trada solo con SP500 sopra EMA",
-        value=False,
-        help="Vale sia per LONG sia per SHORT. Usa Close SP500 ed EMA della seduta precedente (T-1)."
+    bt_spx_mode = st.selectbox(
+        "Filtro regime SP500",
+        ["OFF", "SOLO SOPRA EMA", "SOLO SOTTO EMA"],
+        index=0,
+        help=(
+            "Vale sia per LONG sia per SHORT. Il regime usa Close SP500 ed EMA "
+            "della seduta precedente (T-1), quindi senza look-ahead."
+        ),
     )
     bt_spx_ema_period = st.number_input(
         "Periodo EMA SP500", min_value=5, max_value=200, value=21, step=1, key="bt_spx_ema_period"
@@ -1220,8 +1253,8 @@ if run_backtest:
         f"Backtest: **{bt_start} → {bt_end}** · "
         f"Filtro ≥ **{bt_threshold_pct}%** · ATR **{int(bt_atr_period)}** · "
         f"Forza **{bt_strength}** · Stop **{bt_stop_atr:.2f} ATR** · "
-        f"Max trade/giorno **{bt_max_trades_day}** · "
-        f"Regime SPX **{'SOLO SOPRA EMA' + str(int(bt_spx_ema_period)) if bt_spx_filter else 'OFF'}** · "
+        f"Max trade/giorno **1** · "
+        f"Regime SPX **{bt_spx_mode} EMA{int(bt_spx_ema_period) if bt_spx_mode != 'OFF' else ''}** · "
         f"Universo **{bt_universe_source}**"
     )
 
@@ -1236,9 +1269,8 @@ if run_backtest:
         direction_filter=bt_direction,
         require_return_coherence=bool(bt_coherence),
         min_sample_coverage=bt_sample_coverage_pct / 100,
-        use_spx_filter=bool(bt_spx_filter),
+        spx_filter_mode=bt_spx_mode,
         spx_ema_period=int(bt_spx_ema_period),
-        max_trades_per_day=bt_max_trades_day,
     )
 
     render_backtest_results(
@@ -1247,7 +1279,7 @@ if run_backtest:
         atr_period=int(bt_atr_period),
         stop_atr_mult=float(bt_stop_atr),
         spx_ema_period=int(bt_spx_ema_period),
-        use_spx_filter=bool(bt_spx_filter),
+        spx_filter_mode=bt_spx_mode,
     )
     st.stop()
 
