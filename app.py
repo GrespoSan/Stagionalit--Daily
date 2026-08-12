@@ -676,6 +676,237 @@ def backtest_metrics(trades: pd.DataFrame) -> dict:
     }
 
 
+
+def prepare_asset_for_fast_backtest(df: pd.DataFrame, atr_period: int) -> tuple[pd.DataFrame, dict]:
+    """
+    Precalcola una sola volta ATR(T-1), Close(T-1) e gli indici stagionali
+    mese/giorno per un asset. Evita di ricostruire gli stessi dati per ogni seduta.
+    """
+    work = df.copy()
+
+    prev_close = work["Close"].shift(1)
+    tr = pd.concat(
+        [
+            work["High"] - work["Low"],
+            (work["High"] - prev_close).abs(),
+            (work["Low"] - prev_close).abs(),
+        ],
+        axis=1,
+    ).max(axis=1)
+
+    # L'ATR usato sul giorno T deve essere noto PRIMA dell'Open di T:
+    # rolling ATR fino a T-1, quindi shift(1).
+    work["_ATR_PREV"] = tr.rolling(int(atr_period), min_periods=int(atr_period)).mean().shift(1)
+    work["_CLOSE_PREV"] = work["Close"].shift(1)
+
+    seasonal_lookup = {}
+    valid = work.dropna(subset=["Return"])
+    for (month, day), grp in valid.groupby([valid.index.month, valid.index.day]):
+        seasonal_lookup[(int(month), int(day))] = (
+            grp.index.year.to_numpy(dtype=int),
+            grp["Return"].to_numpy(dtype=float),
+        )
+
+    return work, seasonal_lookup
+
+
+def fast_window_stats(
+    seasonal_lookup: dict,
+    target_date: date,
+    years: int,
+) -> dict:
+    """
+    Statistiche Forecaster sullo stesso giorno di calendario nei precedenti N anni.
+    Usa array preindicizzati: nessuna scansione ripetuta del DataFrame completo.
+    """
+    pair = seasonal_lookup.get((target_date.month, target_date.day))
+    if pair is None:
+        return {
+            "n": 0,
+            "long_prob": np.nan,
+            "short_prob": np.nan,
+            "avg": np.nan,
+            "median": np.nan,
+        }
+
+    hist_years, hist_returns = pair
+    y = target_date.year
+    mask = (hist_years >= y - int(years)) & (hist_years < y)
+    vals = hist_returns[mask]
+    vals = vals[~np.isnan(vals)]
+    n = int(vals.size)
+
+    if n == 0:
+        return {
+            "n": 0,
+            "long_prob": np.nan,
+            "short_prob": np.nan,
+            "avg": np.nan,
+            "median": np.nan,
+        }
+
+    return {
+        "n": n,
+        "long_prob": float(np.mean(vals > 0)),
+        "short_prob": float(np.mean(vals < 0)),
+        "avg": float(np.mean(vals)),
+        "median": float(np.median(vals)),
+    }
+
+
+def fast_analyze_target(
+    name: str,
+    ticker: str,
+    prepared_df: pd.DataFrame,
+    seasonal_lookup: dict,
+    target_date: date,
+    threshold: float,
+) -> dict:
+    """
+    Versione ottimizzata di analyze_target usata SOLO dal backtest.
+    Mantiene la stessa logica statistica, ma riutilizza i dati precalcolati.
+    """
+    stats = {w: fast_window_stats(seasonal_lookup, target_date, w) for w in WINDOWS}
+
+    long_ok = all(
+        not pd.isna(stats[w]["long_prob"]) and stats[w]["long_prob"] >= threshold
+        for w in WINDOWS
+    )
+    short_ok = all(
+        not pd.isna(stats[w]["short_prob"]) and stats[w]["short_prob"] >= threshold
+        for w in WINDOWS
+    )
+
+    if long_ok and not short_ok:
+        bias = "LONG"
+    elif short_ok and not long_ok:
+        bias = "SHORT"
+    else:
+        bias = "—"
+
+    avg10 = stats[10]["avg"]
+    avg15 = stats[15]["avg"]
+    avg20 = stats[20]["avg"]
+    avg_returns = [avg10, avg15, avg20]
+
+    if bias != "—" and all(not pd.isna(x) for x in avg_returns):
+        target_median_3 = float(np.median(avg_returns))
+        original_target = abs(target_median_3)
+    else:
+        target_median_3 = np.nan
+        original_target = np.nan
+
+    dt = pd.Timestamp(target_date)
+    if dt in prepared_df.index:
+        atr_value = prepared_df.at[dt, "_ATR_PREV"]
+        last_close = prepared_df.at[dt, "_CLOSE_PREV"]
+    else:
+        atr_value = np.nan
+        last_close = np.nan
+
+    if pd.isna(atr_value) or pd.isna(last_close) or float(last_close) == 0:
+        atr_value = np.nan
+        atr_pct = np.nan
+    else:
+        atr_value = float(atr_value)
+        last_close = float(last_close)
+        atr_pct = atr_value / last_close
+
+    target_atr = (
+        original_target / atr_pct
+        if not pd.isna(original_target) and not pd.isna(atr_pct) and atr_pct > 0
+        else np.nan
+    )
+
+    target_pts = (
+        atr_value * target_atr
+        if not pd.isna(atr_value) and not pd.isna(target_atr)
+        else np.nan
+    )
+
+    if bias == "LONG":
+        directional_probs = [stats[w]["long_prob"] for w in WINDOWS]
+    elif bias == "SHORT":
+        directional_probs = [stats[w]["short_prob"] for w in WINDOWS]
+    else:
+        directional_probs = []
+
+    score = float(np.mean(directional_probs)) if directional_probs else np.nan
+
+    return {
+        "Date": target_date,
+        "Asset": name,
+        "Ticker": ticker,
+        "Bias": bias,
+        "10Y": stats[10]["long_prob"] if bias == "LONG" else stats[10]["short_prob"] if bias == "SHORT" else np.nan,
+        "15Y": stats[15]["long_prob"] if bias == "LONG" else stats[15]["short_prob"] if bias == "SHORT" else np.nan,
+        "20Y": stats[20]["long_prob"] if bias == "LONG" else stats[20]["short_prob"] if bias == "SHORT" else np.nan,
+        "Avg 10Y": avg10,
+        "Avg 15Y": avg15,
+        "Avg 20Y": avg20,
+        "Mediana 3 rend.": target_median_3,
+        "Target orig.": original_target,
+        "ATR pts": atr_value,
+        "ATR%": atr_pct,
+        "Target/ATR": target_atr,
+        "Target pts": target_pts,
+        "Forza mov.": movement_class(target_atr),
+        "Score": score,
+        "N10": stats[10]["n"],
+        "N15": stats[15]["n"],
+        "N20": stats[20]["n"],
+    }
+
+
+def prepare_spx_for_fast_backtest(spx_df: pd.DataFrame, ema_period: int) -> pd.DataFrame:
+    """
+    Precalcola l'EMA SPX una sola volta. La ricerca del regime per ogni trade
+    diventa una semplice lookup della seduta precedente.
+    """
+    if spx_df is None or spx_df.empty:
+        return pd.DataFrame()
+
+    out = spx_df[["Close"]].copy()
+    out["_EMA"] = out["Close"].ewm(span=int(ema_period), adjust=False).mean()
+    return out
+
+
+def fast_spx_regime_before_date(
+    spx_prepared: pd.DataFrame,
+    target_date: date,
+) -> dict:
+    out = {
+        "SPX Regime": "NO DATI",
+        "SPX Prev Close": np.nan,
+        "SPX EMA": np.nan,
+        "SPX Above EMA": False,
+    }
+
+    if spx_prepared is None or spx_prepared.empty:
+        return out
+
+    target_ts = pd.Timestamp(target_date)
+    pos = int(spx_prepared.index.searchsorted(target_ts, side="left")) - 1
+    if pos < 0:
+        return out
+
+    prev_close = spx_prepared["Close"].iloc[pos]
+    prev_ema = spx_prepared["_EMA"].iloc[pos]
+    if pd.isna(prev_close) or pd.isna(prev_ema):
+        return out
+
+    prev_close = float(prev_close)
+    prev_ema = float(prev_ema)
+    above = prev_close > prev_ema
+
+    return {
+        "SPX Regime": "SOPRA EMA" if above else "SOTTO EMA",
+        "SPX Prev Close": prev_close,
+        "SPX EMA": prev_ema,
+        "SPX Above EMA": above,
+    }
+
+
 def run_manual_backtest(
     universe: dict,
     start_date: date,
@@ -691,58 +922,74 @@ def run_manual_backtest(
     spx_ema_period: int,
 ) -> tuple[pd.DataFrame, list]:
     """
-    Backtest day-by-day senza look-ahead.
-    Ogni data usa soltanto anni precedenti per la stagionalità e sedute precedenti per ATR.
+    Backtest ottimizzato:
+    - ogni storico viene scaricato una sola volta;
+    - ATR viene precalcolato una sola volta per asset;
+    - lo storico stagionale viene indicizzato una sola volta per mese/giorno;
+    - EMA SPX viene precalcolata una sola volta;
+    - massimo 1 trade/giorno, selezionato PRIMA di conoscere l'esito.
     """
-    all_trades = []
+    candidates_list = []
     errors = []
+    data_cache = {}
+
     spx_df = download_spx_history()
-    if spx_df.empty:
+    spx_prepared = prepare_spx_for_fast_backtest(spx_df, int(spx_ema_period))
+    if spx_prepared.empty:
         errors.append("S&P 500 (^GSPC): dati regime non disponibili")
 
     progress = st.progress(0)
     status = st.empty()
 
     items = list(universe.items())
+    total_assets = max(len(items), 1)
+
     for i, (name, ticker) in enumerate(items, start=1):
-        status.write(f"Backtest {name} ({ticker})…")
+        status.write(f"Backtest {name} ({ticker}) — preparazione dati…")
         df = download_history(ticker)
 
         if df.empty:
             errors.append(f"{name} ({ticker}): dati daily non disponibili")
-            progress.progress(i / len(items))
+            progress.progress(i / total_assets)
             continue
 
-        # Solo sedute realmente presenti nel dataset e già concluse.
-        mask = (
-            (df.index.date >= start_date)
-            & (df.index.date <= end_date)
-            & (df.index.date < date.today())
+        data_cache[ticker] = df
+        prepared_df, seasonal_lookup = prepare_asset_for_fast_backtest(
+            df=df,
+            atr_period=int(atr_period),
         )
-        trade_dates = df.index[mask]
 
-        # schedule è mantenuto per compatibilità con analyze_target; il metodo
-        # Forecaster non usa più la N-esima seduta.
-        schedule = nyse_schedule(start_date.year - 21, end_date.year)
+        # Solo sedute realmente presenti e già concluse.
+        start_ts = pd.Timestamp(start_date)
+        end_ts = pd.Timestamp(end_date)
+        today_ts = pd.Timestamp(date.today())
+        trade_index = prepared_df.index[
+            (prepared_df.index >= start_ts)
+            & (prepared_df.index <= end_ts)
+            & (prepared_df.index < today_ts)
+        ]
 
-        for dt in trade_dates:
+        status.write(
+            f"Backtest {name} ({ticker}) — {len(trade_index)} sedute…"
+        )
+
+        for dt in trade_index:
             d = dt.date()
-            target = pd.Series({"date": d, "month": d.month, "tdom": 0})
 
-            sig = analyze_target(
+            sig = fast_analyze_target(
                 name=name,
                 ticker=ticker,
-                df=df,
-                target=target,
+                prepared_df=prepared_df,
+                seasonal_lookup=seasonal_lookup,
+                target_date=d,
                 threshold=threshold,
-                schedule=schedule,
-                atr_period=int(atr_period),
             )
 
             if sig["Bias"] not in ("LONG", "SHORT"):
                 continue
 
-            regime = spx_regime_before_date(spx_df, d, int(spx_ema_period))
+            regime = fast_spx_regime_before_date(spx_prepared, d)
+
             if spx_filter_mode == "SOLO SOPRA EMA" and not regime["SPX Above EMA"]:
                 continue
             if spx_filter_mode == "SOLO SOTTO EMA" and regime["SPX Regime"] != "SOTTO EMA":
@@ -753,11 +1000,10 @@ def run_manual_backtest(
             if direction_filter == "SOLO SHORT" and sig["Bias"] != "SHORT":
                 continue
 
-            # Copertura minima reale delle finestre 10/15/20.
             coverages = [
-                sig["N10"] / 10 if 10 else 0,
-                sig["N15"] / 15 if 15 else 0,
-                sig["N20"] / 20 if 20 else 0,
+                sig["N10"] / 10,
+                sig["N15"] / 15,
+                sig["N20"] / 20,
             ]
             if min(coverages) < min_sample_coverage:
                 continue
@@ -768,9 +1014,7 @@ def run_manual_backtest(
             if require_return_coherence and not signal_return_coherent(sig):
                 continue
 
-            # Prima raccogliamo i CANDIDATI. L'esito non viene ancora calcolato:
-            # la selezione dei trade giornalieri deve avvenire senza conoscere WIN/LOSS.
-            all_trades.append({
+            candidates_list.append({
                 "Date": d,
                 "Asset": name,
                 "Ticker": ticker,
@@ -793,36 +1037,39 @@ def run_manual_backtest(
                 "SPX EMA": regime["SPX EMA"],
             })
 
-        progress.progress(i / len(items))
+        progress.progress(i / total_assets)
 
-    status.empty()
-    progress.empty()
+    status.write("Selezione del miglior trade di ogni giornata…")
 
-    candidates = pd.DataFrame(all_trades)
+    candidates = pd.DataFrame(candidates_list)
     if candidates.empty:
+        status.empty()
+        progress.empty()
         return candidates, errors
 
-    # Numero di candidati disponibili in ciascuna giornata PRIMA del limite.
+    # Conteggio candidati PRIMA del limite giornaliero.
     daily_counts = candidates.groupby("Date").size()
     candidates["Candidati giorno"] = candidates["Date"].map(daily_counts)
 
-    # Ranking deterministico e conoscibile prima dell'entry:
+    # Ranking disponibile ex-ante:
     # 1) Target/ATR più alto
-    # 2) Score stagionale più alto
-    # 3) nome asset, solo come tie-break
+    # 2) Score più alto
+    # 3) Asset alfabetico come tie-break
     candidates = candidates.sort_values(
         ["Date", "Target/ATR", "Score", "Asset"],
         ascending=[True, False, False, True],
     ).reset_index(drop=True)
     candidates["Rank giorno"] = candidates.groupby("Date").cumcount() + 1
 
-    # Regola fissa della strategia: massimo 1 trade al giorno.
-    candidates = candidates[candidates["Rank giorno"] <= 1].copy()
+    # Regola fissa: massimo 1 trade al giorno.
+    selected = candidates[candidates["Rank giorno"] == 1].copy()
 
-    # Solo ORA, dopo la selezione, calcoliamo l'esito del trade.
+    status.write(f"Valutazione esito di {len(selected)} trade selezionati…")
+
     evaluated = []
-    for _, row in candidates.iterrows():
-        df_eval = download_history(row["Ticker"])
+    for _, row in selected.iterrows():
+        df_eval = data_cache.get(row["Ticker"], pd.DataFrame())
+
         trade = evaluate_backtest_trade(
             ticker=row["Ticker"],
             df=df_eval,
@@ -832,13 +1079,18 @@ def run_manual_backtest(
             atr_pts=row["ATR pts"],
             stop_atr_mult=stop_atr_mult,
         )
+
         record = row.to_dict()
         record.update(trade)
         evaluated.append(record)
 
+    status.empty()
+    progress.empty()
+
     bt = pd.DataFrame(evaluated)
     if not bt.empty:
         bt = bt.sort_values(["Date", "Rank giorno", "Asset"]).reset_index(drop=True)
+
     return bt, errors
 
 
@@ -1209,6 +1461,10 @@ with st.sidebar:
     )
 
     run_backtest = st.button("Esegui backtest", type="secondary", width="stretch")
+    st.caption(
+        "Motore V3.5 ottimizzato: storici, ATR, stagionalità ed EMA SPX "
+        "vengono precalcolati e riutilizzati durante il backtest."
+    )
 
     st.divider()
     st.subheader("Universo")

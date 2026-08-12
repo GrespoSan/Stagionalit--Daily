@@ -356,3 +356,22 @@ Definizioni:
 quindi esclude sia MEDIO/DEBOLE sia FORTE.
 
 La regola di 1 trade massimo al giorno resta fissa.
+
+
+## V3.5 — motore backtest ottimizzato
+
+La logica della strategia non cambia.
+
+Ottimizzazioni:
+- ogni storico asset viene scaricato una sola volta per esecuzione;
+- ATR(T-1) viene precalcolato una sola volta per asset;
+- i rendimenti stagionali vengono indicizzati per mese/giorno;
+- le finestre 10Y/15Y/20Y non ricostruiscono più DataFrame ad ogni seduta;
+- EMA S&P 500 viene calcolata una sola volta;
+- il regime SPX usa lookup sulla seduta precedente;
+- dopo il ranking giornaliero l'esito viene calcolato solo sul trade realmente selezionato;
+- massimo 1 trade al giorno resta fisso;
+- nessun cambiamento alle regole di filtro, target, stop o NO DATI.
+
+La V3.5 è pensata per backtest pluriennali e prepara il motore per il futuro
+ottimizzatore automatico.
