@@ -276,3 +276,8 @@ Metriche:
 
 La V3.0 è volutamente manuale. L'ottimizzatore automatico dei parametri va aggiunto
 solo dopo aver verificato che questo motore di backtest produca risultati coerenti.
+
+
+## V3.1 — filtro regime S&P 500
+
+Sia LONG sia SHORT possono essere ammessi solo quando SPX Close(T-1) è sopra EMA(T-1). Periodo EMA modificabile, default 21. La diagnostica confronta SOPRA EMA / SOTTO EMA / NO DATI.

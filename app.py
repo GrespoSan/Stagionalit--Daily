@@ -412,6 +412,29 @@ def analyze_target(
 
 
 
+@st.cache_data(ttl=6 * 60 * 60, show_spinner=False)
+def download_spx_history() -> pd.DataFrame:
+    return download_history("^GSPC")
+
+
+def spx_regime_before_date(spx_df: pd.DataFrame, target_date: date, ema_period: int) -> dict:
+    out = {"SPX Regime": "NO DATI", "SPX Prev Close": np.nan, "SPX EMA": np.nan, "SPX Above EMA": False}
+    if spx_df is None or spx_df.empty:
+        return out
+    hist = spx_df.loc[spx_df.index < pd.Timestamp(target_date)].copy()
+    if len(hist) < ema_period:
+        return out
+    ema = hist["Close"].ewm(span=ema_period, adjust=False).mean()
+    prev_close = hist["Close"].iloc[-1]
+    prev_ema = ema.iloc[-1]
+    if pd.isna(prev_close) or pd.isna(prev_ema):
+        return out
+    prev_close = float(prev_close)
+    prev_ema = float(prev_ema)
+    above = prev_close > prev_ema
+    return {"SPX Regime": "SOPRA EMA" if above else "SOTTO EMA", "SPX Prev Close": prev_close, "SPX EMA": prev_ema, "SPX Above EMA": above}
+
+
 def strength_min_ratio(label: str) -> float:
     mapping = {
         "TUTTI": 0.0,
@@ -635,6 +658,8 @@ def run_manual_backtest(
     direction_filter: str,
     require_return_coherence: bool,
     min_sample_coverage: float,
+    use_spx_filter: bool,
+    spx_ema_period: int,
 ) -> tuple[pd.DataFrame, list]:
     """
     Backtest day-by-day senza look-ahead.
@@ -643,6 +668,9 @@ def run_manual_backtest(
     all_trades = []
     errors = []
     min_ratio = strength_min_ratio(strength_filter)
+    spx_df = download_spx_history()
+    if spx_df.empty:
+        errors.append("S&P 500 (^GSPC): dati regime non disponibili")
 
     progress = st.progress(0)
     status = st.empty()
@@ -684,6 +712,10 @@ def run_manual_backtest(
             )
 
             if sig["Bias"] not in ("LONG", "SHORT"):
+                continue
+
+            regime = spx_regime_before_date(spx_df, d, int(spx_ema_period))
+            if use_spx_filter and not regime["SPX Above EMA"]:
                 continue
 
             if direction_filter == "SOLO LONG" and sig["Bias"] != "LONG":
@@ -734,6 +766,9 @@ def run_manual_backtest(
                 "Target pts": sig["Target pts"],
                 "Target/ATR": sig["Target/ATR"],
                 "Coerente": signal_return_coherent(sig),
+                "SPX Regime": regime["SPX Regime"],
+                "SPX Prev Close": regime["SPX Prev Close"],
+                "SPX EMA": regime["SPX EMA"],
                 **trade,
             })
 
@@ -756,7 +791,7 @@ def format_metric(v, fmt=".2f"):
     return format(v, fmt)
 
 
-def render_backtest_results(bt: pd.DataFrame, errors: list, atr_period: int, stop_atr_mult: float):
+def render_backtest_results(bt: pd.DataFrame, errors: list, atr_period: int, stop_atr_mult: float, spx_ema_period: int, use_spx_filter: bool):
     st.header("🧪 Backtest manuale")
 
     if bt.empty:
@@ -792,6 +827,32 @@ def render_backtest_results(bt: pd.DataFrame, errors: list, atr_period: int, sto
         daily_equity["Equity R"] = daily_equity["R"].cumsum()
         st.subheader("Equity cumulata in R")
         st.line_chart(daily_equity.set_index("Date")["Equity R"])
+
+    st.subheader(f"Risultati per regime S&P 500 / EMA{int(spx_ema_period)}")
+    regime_rows = []
+    for regime_name in ["SOPRA EMA", "SOTTO EMA", "NO DATI"]:
+        part = bt[bt["SPX Regime"] == regime_name] if "SPX Regime" in bt.columns else pd.DataFrame()
+        if part.empty:
+            continue
+        mm = backtest_metrics(part)
+        regime_rows.append({
+            "Regime SPX": regime_name,
+            "Segnali": mm["signals"],
+            "Valutabili": mm["valid"],
+            "NO DATI": mm["no_data"],
+            "Win Rate": mm["win_rate"],
+            "Profit Factor": mm["profit_factor"],
+            "Expectancy R": mm["expectancy_r"],
+            "Totale R": mm["total_r"],
+            "Max DD R": mm["max_dd_r"],
+        })
+    if regime_rows:
+        rf = pd.DataFrame(regime_rows)
+        rf["Win Rate"] = rf["Win Rate"].map(lambda x: "n/d" if pd.isna(x) else f"{x:.1%}")
+        for c in ["Profit Factor", "Expectancy R", "Totale R", "Max DD R"]:
+            rf[c] = rf[c].map(lambda x: "n/d" if pd.isna(x) else ("∞" if np.isinf(x) else f"{x:.2f}"))
+        st.dataframe(rf, width="stretch", hide_index=True)
+    st.caption("Regime calcolato con Close SPX e EMA della seduta precedente (T−1). Con filtro attivo, sia LONG sia SHORT sono ammessi solo con SPX sopra EMA.")
 
     st.subheader("Risultati per forza movimento")
     strength_order = ["DEBOLE", "MEDIO", "BUONO", "FORTE"]
@@ -844,13 +905,15 @@ def render_backtest_results(bt: pd.DataFrame, errors: list, atr_period: int, sto
     for c in ["Score", "10Y", "15Y", "20Y", "Target %"]:
         disp[c] = disp[c].map(lambda x: "n/d" if pd.isna(x) else f"{x:.1%}")
     disp["Target/ATR"] = disp["Target/ATR"].map(lambda x: "n/d" if pd.isna(x) else f"{x:.0%}")
-    for c in ["ATR pts", "Target pts", "SL pts", "Open", "Close", "Exit price", "PnL pts", "R"]:
-        disp[c] = disp[c].map(lambda x: "n/d" if pd.isna(x) else f"{x:,.2f}")
+    for c in ["ATR pts", "Target pts", "SL pts", "SPX Prev Close", "SPX EMA", "Open", "Close", "Exit price", "PnL pts", "R"]:
+        if c in disp.columns:
+            disp[c] = disp[c].map(lambda x: "n/d" if pd.isna(x) else f"{x:,.2f}")
 
     show_cols = [
         "Date", "Asset", "Ticker", "Bias", "Forza", "Score",
         "10Y", "15Y", "20Y", "N10", "N15", "N20",
         "Target %", "ATR pts", "Target pts", "SL pts",
+        "SPX Regime", "SPX Prev Close", "SPX EMA",
         "Open", "Exit reason", "Outcome", "PnL pts", "R", "Coerente"
     ]
     st.dataframe(disp[show_cols], width="stretch", hide_index=True)
@@ -859,6 +922,8 @@ def render_backtest_results(bt: pd.DataFrame, errors: list, atr_period: int, sto
         st.write(
             "• La stagionalità di ogni data usa esclusivamente anni precedenti alla data testata.\\n"
             "• L'ATR usa esclusivamente sedute precedenti.\\n"
+            f"• Il regime SPX usa Close e EMA{int(spx_ema_period)} della seduta precedente (T−1).\\n"
+            "• Se il filtro SPX è attivo, sia LONG sia SHORT richiedono SPX sopra EMA.\\n"
             "• Se né target né stop vengono raggiunti, il trade viene chiuso al Close.\\n"
             "• Se target e stop sono entrambi toccati nella stessa seduta e non possiamo "
             "stabilire l'ordine con dati intraday, l'esito è NO DATI e il trade non entra nelle metriche.\\n"
@@ -1020,6 +1085,16 @@ with st.sidebar:
         help="Filtro opzionale sulla quota di osservazioni realmente disponibili nelle finestre 10/15/20 anni."
     )
 
+    st.markdown("**Regime S&P 500**")
+    bt_spx_filter = st.checkbox(
+        "Trada solo con SP500 sopra EMA",
+        value=False,
+        help="Vale sia per LONG sia per SHORT. Usa Close SP500 ed EMA della seduta precedente (T-1)."
+    )
+    bt_spx_ema_period = st.number_input(
+        "Periodo EMA SP500", min_value=5, max_value=200, value=21, step=1, key="bt_spx_ema_period"
+    )
+
     run_backtest = st.button("Esegui backtest", type="secondary", width="stretch")
 
     st.divider()
@@ -1102,6 +1177,7 @@ if run_backtest:
         f"Backtest: **{bt_start} → {bt_end}** · "
         f"Filtro ≥ **{bt_threshold_pct}%** · ATR **{int(bt_atr_period)}** · "
         f"Forza **{bt_strength}** · Stop **{bt_stop_atr:.2f} ATR** · "
+        f"Regime SPX **{'SOLO SOPRA EMA' + str(int(bt_spx_ema_period)) if bt_spx_filter else 'OFF'}** · "
         f"Universo **{bt_universe_source}**"
     )
 
@@ -1116,6 +1192,8 @@ if run_backtest:
         direction_filter=bt_direction,
         require_return_coherence=bool(bt_coherence),
         min_sample_coverage=bt_sample_coverage_pct / 100,
+        use_spx_filter=bool(bt_spx_filter),
+        spx_ema_period=int(bt_spx_ema_period),
     )
 
     render_backtest_results(
@@ -1123,6 +1201,8 @@ if run_backtest:
         errors=bt_errors,
         atr_period=int(bt_atr_period),
         stop_atr_mult=float(bt_stop_atr),
+        spx_ema_period=int(bt_spx_ema_period),
+        use_spx_filter=bool(bt_spx_filter),
     )
     st.stop()
 
