@@ -187,3 +187,28 @@ GC=F
 Nel secondo caso il ticker viene usato anche come nome visualizzato.
 
 È incluso `asset_list_example.txt` con l'universo predefinito completo.
+
+
+## V2.0 — Stop ATR e verifica WIN/LOSS
+
+Regola operativa:
+- Entry = Open della giornata
+- Target LONG = Open + Target pts
+- Target SHORT = Open - Target pts
+- Stop LONG = Open - 50% ATR pts
+- Stop SHORT = Open + 50% ATR pts
+
+Nuove colonne:
+- SL 50% ATR in punti
+- Esito
+
+Esiti:
+- WIN = target raggiunto prima dello stop
+- LOSS = stop raggiunto prima del target
+- NO HIT = nessun livello raggiunto nella giornata conclusa
+- PENDING = giornata corrente/futura, quindi non ancora valutata
+- AMBIGUO = target e stop toccati nella stessa giornata senza ordine determinabile
+
+Quando Daily High/Low toccano entrambi i livelli, l'app prova le barre 5 minuti per stabilire quale sia stato raggiunto prima. Se entrambi risultano toccati nella stessa barra 5m o l'intraday non è disponibile, l'esito resta AMBIGUO.
+
+Nota: con Target = 25% ATR e Stop = 50% ATR, il break-even teorico è 66,7% prima di costi/slippage.

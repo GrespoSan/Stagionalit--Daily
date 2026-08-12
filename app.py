@@ -91,6 +91,64 @@ def download_history(ticker: str, start: str = "1990-01-01") -> pd.DataFrame:
     return df
 
 
+@st.cache_data(ttl=60 * 60, show_spinner=False)
+def download_intraday_5m(ticker: str, target_date: date) -> pd.DataFrame:
+    """Barre 5m della singola data, usate solo per risolvere l'ordine target/stop."""
+    try:
+        df = yf.download(ticker,start=target_date.isoformat(),end=(target_date+timedelta(days=1)).isoformat(),interval="5m",auto_adjust=False,actions=False,progress=False,threads=False,prepost=True)
+    except Exception:
+        return pd.DataFrame()
+    if df is None or df.empty:
+        return pd.DataFrame()
+    if isinstance(df.columns,pd.MultiIndex):
+        if ticker in df.columns.get_level_values(-1): df=df.xs(ticker,axis=1,level=-1)
+        else: df.columns=df.columns.get_level_values(0)
+    if any(c not in df.columns for c in ["Open","High","Low","Close"]):
+        return pd.DataFrame()
+    df=df[["Open","High","Low","Close"]].copy()
+    idx=pd.to_datetime(df.index)
+    try: idx=idx.tz_localize(None) if idx.tz is None else idx.tz_convert(None)
+    except Exception: pass
+    df.index=idx
+    return df.dropna(subset=["High","Low"]).sort_index()
+
+def resolve_intraday_order(bars: pd.DataFrame,bias: str,target_level: float,stop_level: float) -> str:
+    if bars is None or bars.empty: return "AMBIGUO"
+    for _,bar in bars.iterrows():
+        hi=float(bar["High"]); lo=float(bar["Low"])
+        if bias=="LONG": hit_target=hi>=target_level; hit_stop=lo<=stop_level
+        else: hit_target=lo<=target_level; hit_stop=hi>=stop_level
+        if hit_target and hit_stop: return "AMBIGUO"
+        if hit_target: return "WIN"
+        if hit_stop: return "LOSS"
+    return "NO HIT"
+
+def evaluate_trade_outcome(ticker: str,df: pd.DataFrame,target_date: date,bias: str,target_pts: float,atr_pts: float) -> dict:
+    result={"Open trade":np.nan,"Target level":np.nan,"Stop level":np.nan,"SL 50% ATR pts":np.nan,"Esito":"PENDING"}
+    if bias not in ("LONG","SHORT"):
+        result["Esito"]="—"; return result
+    if pd.isna(target_pts) or pd.isna(atr_pts):
+        result["Esito"]="N/D"; return result
+    # La colonna WIN/LOSS valuta solo giornate completamente trascorse.
+    if target_date >= date.today():
+        return result
+    dt=pd.Timestamp(target_date)
+    if dt not in df.index: return result
+    op=df.at[dt,"Open"]; hi=df.at[dt,"High"]; lo=df.at[dt,"Low"]
+    if pd.isna(op) or pd.isna(hi) or pd.isna(lo):
+        result["Esito"]="N/D"; return result
+    op=float(op); hi=float(hi); lo=float(lo); sl_pts=.5*float(atr_pts)
+    if bias=="LONG":
+        target_level=op+float(target_pts); stop_level=op-sl_pts; hit_target=hi>=target_level; hit_stop=lo<=stop_level
+    else:
+        target_level=op-float(target_pts); stop_level=op+sl_pts; hit_target=lo<=target_level; hit_stop=hi>=stop_level
+    result.update({"Open trade":op,"Target level":target_level,"Stop level":stop_level,"SL 50% ATR pts":sl_pts})
+    if hit_target and not hit_stop: result["Esito"]="WIN"
+    elif hit_stop and not hit_target: result["Esito"]="LOSS"
+    elif not hit_target and not hit_stop: result["Esito"]="NO HIT"
+    else: result["Esito"]=resolve_intraday_order(download_intraday_5m(ticker,target_date),bias,target_level,stop_level)
+    return result
+
 @st.cache_data(ttl=24 * 60 * 60, show_spinner=False)
 def nyse_schedule(start_year: int, end_year: int) -> pd.DataFrame:
     cal = mcal.get_calendar("NYSE")
@@ -563,6 +621,13 @@ if not results:
     st.error("Non è stato possibile calcolare alcun risultato.")
     st.stop()
 
+history_cache = {ticker: download_history(ticker) for ticker in universe.values()}
+for r in results:
+    if r["Bias"] not in ("LONG", "SHORT"):
+        r.update({"Open trade":np.nan,"Target level":np.nan,"Stop level":np.nan,"SL 50% ATR pts":np.nan,"Esito":"—"})
+        continue
+    r.update(evaluate_trade_outcome(ticker=r["Ticker"],df=history_cache.get(r["Ticker"],pd.DataFrame()),target_date=r["Date"],bias=r["Bias"],target_pts=r["Target pts"],atr_pts=r["ATR pts"]))
+
 res = pd.DataFrame([{k: v for k, v in r.items() if k != "_samples"} for r in results])
 opps = res[res["Bias"] != "—"].copy()
 opps = opps.sort_values(["Date", "Score"], ascending=[True, False])
@@ -586,12 +651,13 @@ else:
             "Forza mov.", "Score",
             "10Y", "15Y", "20Y",
             "Avg 10Y", "Avg 15Y", "Avg 20Y", "Mediana 3 rend.",
-            "Target orig.", "Stop orig.",
-            "ATR pts", "Target pts"
+            "Target orig.",
+            "ATR pts", "Target pts",
+            "SL 50% ATR pts", "Esito"
         ]
     ].copy()
 
-    for col in ["10Y", "15Y", "20Y", "Avg 10Y", "Avg 15Y", "Avg 20Y", "Mediana 3 rend.", "Target orig.", "Stop orig.", "Score"]:
+    for col in ["10Y", "15Y", "20Y", "Avg 10Y", "Avg 15Y", "Avg 20Y", "Mediana 3 rend.", "Target orig.", "Score"]:
         display[col] = display[col].map(pct)
 
     display["ATR pts"] = display["ATR pts"].map(
@@ -600,11 +666,15 @@ else:
     display["Target pts"] = display["Target pts"].map(
         lambda x: "n/d" if pd.isna(x) else f"{x:,.2f}"
     )
+    display["SL 50% ATR pts"] = display["SL 50% ATR pts"].map(
+        lambda x: "n/d" if pd.isna(x) else f"{x:,.2f}"
+    )
 
     display = display.rename(
         columns={
             "ATR pts": f"ATR{int(atr_period)} pts",
-            "Target pts": "Target pts"
+            "Target pts": "Target pts",
+            "SL 50% ATR pts": f"SL 50% ATR{int(atr_period)} pts"
         }
     )
 
@@ -624,10 +694,17 @@ else:
         }
         return styles.get(val, "")
 
+    def color_outcome(val):
+        if val == "WIN": return "color: #21c55d; font-weight: 800;"
+        if val == "LOSS": return "color: #ff4b4b; font-weight: 800;"
+        if val == "AMBIGUO": return "color: #f0a000; font-weight: 800;"
+        return ""
+
     styled_display = (
         display.style
         .map(color_bias, subset=["Bias"])
         .map(color_strength, subset=["Forza mov."])
+        .map(color_outcome, subset=["Esito"])
     )
     st.dataframe(styled_display, width="stretch", hide_index=True)
 
@@ -670,13 +747,22 @@ if valid_keys:
     target_pts_txt = "n/d" if pd.isna(original["Target pts"]) else f"{original['Target pts']:,.2f}"
     target_atr_txt = "n/d" if pd.isna(original["Target/ATR"]) else f"{original['Target/ATR']:.0%}"
 
+    sl_pts_txt = "n/d" if pd.isna(original["SL 50% ATR pts"]) else f"{original['SL 50% ATR pts']:,.2f}"
+    open_txt = "n/d" if pd.isna(original["Open trade"]) else f"{original['Open trade']:,.2f}"
+    target_level_txt = "n/d" if pd.isna(original["Target level"]) else f"{original['Target level']:,.2f}"
+    stop_level_txt = "n/d" if pd.isna(original["Stop level"]) else f"{original['Stop level']:,.2f}"
+
     st.write(
-        f"**TP originale:** {pct(original['Target orig.'])}  ·  "
-        f"**SL originale:** {pct(original['Stop orig.'])}  ·  "
+        f"**TP stagionale:** {pct(original['Target orig.'])}  ·  "
         f"**ATR{int(atr_period)}:** {atr_pts_txt} punti  ·  "
         f"**Target:** {target_pts_txt} punti  ·  "
+        f"**SL 50% ATR:** {sl_pts_txt} punti  ·  "
         f"**Target/ATR{int(atr_period)}:** {target_atr_txt}  ·  "
         f"**Forza movimento:** {original['Forza mov.']}"
+    )
+    st.write(
+        f"**Open:** {open_txt}  ·  **Livello Target:** {target_level_txt}  ·  "
+        f"**Livello Stop:** {stop_level_txt}  ·  **Esito:** {original['Esito']}"
     )
 
     hist = original["_samples"][20].copy()
@@ -684,10 +770,9 @@ if valid_keys:
     st.dataframe(hist, width="stretch", hide_index=True)
 
     st.caption(
-        "Il TP e lo SL mostrati replicano la regola descritta: "
-        "target = valore assoluto della mediana dei rendimenti medi 10Y, 15Y e 20Y; "
-        "stop = metà del target. "
-        "La V1 NON afferma ancora che questo TP/SL sia ottimale."
+        "Il target stagionale deriva dalla mediana dei rendimenti medi 10Y, 15Y e 20Y. "
+        "La regola operativa corrente usa uno stop pari al 50% dell'ATR in punti. "
+        "L'esito viene verificato a partire dall'Open della giornata."
     )
 else:
     st.caption("Nessun dettaglio disponibile perché non ci sono opportunità valide.")
@@ -730,11 +815,12 @@ with st.expander("Diagnostica dati / campione"):
 
 st.divider()
 st.info(
-    f"**Forza movimento:** l'app confronta internamente il target stagionale con l'ATR{int(atr_period)}. "
-    "Nella tabella principale mostriamo direttamente i valori operativi: "
-    f"ATR{int(atr_period)} in punti e Target in punti. "
-    "La classe resta: <30% ATR = DEBOLE · 30–50% = MEDIO · "
-    "50–75% = BUONO · ≥75% = FORTE."
+    f"**Esito trade:** entry sull'Open. Target = Open ± Target pts; "
+    f"Stop = Open ∓ 50% dell'ATR{int(atr_period)} in punti. "
+    "WIN = target prima dello stop · LOSS = stop prima del target · "
+    "NO HIT = nessun livello raggiunto · PENDING = giornata non ancora conclusa · "
+    "AMBIGUO = entrambi i livelli toccati senza ordine determinabile. "
+    "Forza: <30% ATR = DEBOLE · 30–50% = MEDIO · 50–75% = BUONO · ≥75% = FORTE."
 )
 
 st.caption(
