@@ -440,9 +440,38 @@ def strength_min_ratio(label: str) -> float:
         "TUTTI": 0.0,
         "MEDIO+": 0.30,
         "BUONO+": 0.50,
+        "SOLO BUONO": 0.50,
         "SOLO FORTE": 0.75,
     }
     return mapping.get(label, 0.0)
+
+
+def strength_passes(label: str, target_atr: float) -> bool:
+    """
+    Applica il filtro forza sul rapporto Target/ATR.
+    Classi:
+    DEBOLE < 0.30
+    MEDIO  0.30 <= x < 0.50
+    BUONO  0.50 <= x < 0.75
+    FORTE  x >= 0.75
+    """
+    if pd.isna(target_atr):
+        return False
+
+    x = float(target_atr)
+
+    if label == "TUTTI":
+        return True
+    if label == "MEDIO+":
+        return x >= 0.30
+    if label == "BUONO+":
+        return x >= 0.50
+    if label == "SOLO BUONO":
+        return 0.50 <= x < 0.75
+    if label == "SOLO FORTE":
+        return x >= 0.75
+
+    return True
 
 
 def signal_return_coherent(row: dict) -> bool:
@@ -667,7 +696,6 @@ def run_manual_backtest(
     """
     all_trades = []
     errors = []
-    min_ratio = strength_min_ratio(strength_filter)
     spx_df = download_spx_history()
     if spx_df.empty:
         errors.append("S&P 500 (^GSPC): dati regime non disponibili")
@@ -734,7 +762,7 @@ def run_manual_backtest(
             if min(coverages) < min_sample_coverage:
                 continue
 
-            if pd.isna(sig["Target/ATR"]) or sig["Target/ATR"] < min_ratio:
+            if not strength_passes(strength_filter, sig["Target/ATR"]):
                 continue
 
             if require_return_coherence and not signal_return_coherent(sig):
@@ -1127,9 +1155,18 @@ with st.sidebar:
     )
     bt_strength = st.selectbox(
         "Forza minima",
-        ["TUTTI", "MEDIO+", "BUONO+", "SOLO FORTE"],
+        ["TUTTI", "MEDIO+", "BUONO+", "SOLO BUONO", "SOLO FORTE"],
         index=0,
+        help=(
+            "SOLO BUONO = Target/ATR >= 0,50 e < 0,75. "
+            "SOLO FORTE = Target/ATR >= 0,75."
+        ),
     )
+    st.caption(
+        "Classi Forza: DEBOLE <30% ATR · MEDIO 30–50% · "
+        "BUONO 50–75% · FORTE ≥75%."
+    )
+
     bt_stop_atr = st.slider(
         "Stop Loss in multipli ATR",
         min_value=0.25,

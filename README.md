@@ -334,3 +334,25 @@ La priorità del trade giornaliero resta:
 1. Target/ATR più alto
 2. Score stagionale più alto
 3. nome asset come tie-break.
+
+
+## V3.4 — filtro SOLO BUONO
+
+Nuova opzione nella selezione `Forza minima`:
+
+- TUTTI
+- MEDIO+
+- BUONO+
+- SOLO BUONO
+- SOLO FORTE
+
+Definizioni:
+- DEBOLE: Target/ATR < 0,30
+- MEDIO: 0,30 <= Target/ATR < 0,50
+- BUONO: 0,50 <= Target/ATR < 0,75
+- FORTE: Target/ATR >= 0,75
+
+`SOLO BUONO` seleziona esclusivamente i segnali compresi tra 0,50 e 0,75 ATR,
+quindi esclude sia MEDIO/DEBOLE sia FORTE.
+
+La regola di 1 trade massimo al giorno resta fissa.
