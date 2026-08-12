@@ -660,6 +660,7 @@ def run_manual_backtest(
     min_sample_coverage: float,
     use_spx_filter: bool,
     spx_ema_period: int,
+    max_trades_per_day: str,
 ) -> tuple[pd.DataFrame, list]:
     """
     Backtest day-by-day senza look-ahead.
@@ -738,16 +739,8 @@ def run_manual_backtest(
             if require_return_coherence and not signal_return_coherent(sig):
                 continue
 
-            trade = evaluate_backtest_trade(
-                ticker=ticker,
-                df=df,
-                target_date=d,
-                bias=sig["Bias"],
-                target_pts=sig["Target pts"],
-                atr_pts=sig["ATR pts"],
-                stop_atr_mult=stop_atr_mult,
-            )
-
+            # Prima raccogliamo i CANDIDATI. L'esito non viene ancora calcolato:
+            # la selezione dei trade giornalieri deve avvenire senza conoscere WIN/LOSS.
             all_trades.append({
                 "Date": d,
                 "Asset": name,
@@ -769,7 +762,6 @@ def run_manual_backtest(
                 "SPX Regime": regime["SPX Regime"],
                 "SPX Prev Close": regime["SPX Prev Close"],
                 "SPX EMA": regime["SPX EMA"],
-                **trade,
             })
 
         progress.progress(i / len(items))
@@ -777,9 +769,48 @@ def run_manual_backtest(
     status.empty()
     progress.empty()
 
-    bt = pd.DataFrame(all_trades)
+    candidates = pd.DataFrame(all_trades)
+    if candidates.empty:
+        return candidates, errors
+
+    # Numero di candidati disponibili in ciascuna giornata PRIMA del limite.
+    daily_counts = candidates.groupby("Date").size()
+    candidates["Candidati giorno"] = candidates["Date"].map(daily_counts)
+
+    # Ranking deterministico e conoscibile prima dell'entry:
+    # 1) Target/ATR più alto
+    # 2) Score stagionale più alto
+    # 3) nome asset, solo come tie-break
+    candidates = candidates.sort_values(
+        ["Date", "Target/ATR", "Score", "Asset"],
+        ascending=[True, False, False, True],
+    ).reset_index(drop=True)
+    candidates["Rank giorno"] = candidates.groupby("Date").cumcount() + 1
+
+    if max_trades_per_day != "TUTTI":
+        max_n = int(max_trades_per_day)
+        candidates = candidates[candidates["Rank giorno"] <= max_n].copy()
+
+    # Solo ORA, dopo la selezione, calcoliamo l'esito del trade.
+    evaluated = []
+    for _, row in candidates.iterrows():
+        df_eval = download_history(row["Ticker"])
+        trade = evaluate_backtest_trade(
+            ticker=row["Ticker"],
+            df=df_eval,
+            target_date=row["Date"],
+            bias=row["Bias"],
+            target_pts=row["Target pts"],
+            atr_pts=row["ATR pts"],
+            stop_atr_mult=stop_atr_mult,
+        )
+        record = row.to_dict()
+        record.update(trade)
+        evaluated.append(record)
+
+    bt = pd.DataFrame(evaluated)
     if not bt.empty:
-        bt = bt.sort_values(["Date", "Asset"]).reset_index(drop=True)
+        bt = bt.sort_values(["Date", "Rank giorno", "Asset"]).reset_index(drop=True)
     return bt, errors
 
 
@@ -913,6 +944,7 @@ def render_backtest_results(bt: pd.DataFrame, errors: list, atr_period: int, sto
         "Date", "Asset", "Ticker", "Bias", "Forza", "Score",
         "10Y", "15Y", "20Y", "N10", "N15", "N20",
         "Target %", "ATR pts", "Target pts", "SL pts",
+        "Candidati giorno", "Rank giorno",
         "SPX Regime", "SPX Prev Close", "SPX EMA",
         "Open", "Exit reason", "Outcome", "PnL pts", "R", "Coerente"
     ]
@@ -927,8 +959,9 @@ def render_backtest_results(bt: pd.DataFrame, errors: list, atr_period: int, sto
             "• Se né target né stop vengono raggiunti, il trade viene chiuso al Close.\\n"
             "• Se target e stop sono entrambi toccati nella stessa seduta e non possiamo "
             "stabilire l'ordine con dati intraday, l'esito è NO DATI e il trade non entra nelle metriche.\\n"
-            "• I trade sono valutati singolarmente: questa versione non limita esposizioni "
-            "simultanee o correlazioni tra asset."
+            "• Il limite Max trade/giorno viene applicato prima di conoscere l'esito, "
+            "ordinando i candidati per Target/ATR e poi Score.\n"
+            "• La versione non applica ancora un limite di rischio complessivo tra giornate o correlazioni tra asset."
         )
 
     if errors:
@@ -1071,6 +1104,16 @@ with st.sidebar:
         ["LONG + SHORT", "SOLO LONG", "SOLO SHORT"],
         index=0,
     )
+    bt_max_trades_day = st.selectbox(
+        "Max trade per giorno",
+        ["1", "2", "3", "TUTTI"],
+        index=0,
+        help=(
+            "Se ci sono più segnali nello stesso giorno, vengono scelti prima "
+            "quelli con Target/ATR più alto e poi con Score stagionale più alto. "
+            "La selezione avviene prima di conoscere l'esito."
+        ),
+    )
     bt_coherence = st.checkbox(
         "Richiedi coerenza Bias / rendimento medio",
         value=False,
@@ -1177,6 +1220,7 @@ if run_backtest:
         f"Backtest: **{bt_start} → {bt_end}** · "
         f"Filtro ≥ **{bt_threshold_pct}%** · ATR **{int(bt_atr_period)}** · "
         f"Forza **{bt_strength}** · Stop **{bt_stop_atr:.2f} ATR** · "
+        f"Max trade/giorno **{bt_max_trades_day}** · "
         f"Regime SPX **{'SOLO SOPRA EMA' + str(int(bt_spx_ema_period)) if bt_spx_filter else 'OFF'}** · "
         f"Universo **{bt_universe_source}**"
     )
@@ -1194,6 +1238,7 @@ if run_backtest:
         min_sample_coverage=bt_sample_coverage_pct / 100,
         use_spx_filter=bool(bt_spx_filter),
         spx_ema_period=int(bt_spx_ema_period),
+        max_trades_per_day=bt_max_trades_day,
     )
 
     render_backtest_results(

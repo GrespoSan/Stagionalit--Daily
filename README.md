@@ -281,3 +281,28 @@ solo dopo aver verificato che questo motore di backtest produca risultati coeren
 ## V3.1 — filtro regime S&P 500
 
 Sia LONG sia SHORT possono essere ammessi solo quando SPX Close(T-1) è sopra EMA(T-1). Periodo EMA modificabile, default 21. La diagnostica confronta SOPRA EMA / SOTTO EMA / NO DATI.
+
+
+## V3.2 — Max trade per giorno
+
+Nuovo parametro:
+- 1
+- 2
+- 3
+- TUTTI
+
+Default: 1.
+
+Se in una stessa giornata ci sono più candidati, la selezione viene effettuata
+PRIMA di calcolare l'esito del trade, quindi senza look-ahead.
+
+Ordine di priorità:
+1. Target/ATR più alto
+2. Score stagionale più alto
+3. Asset in ordine alfabetico come tie-break deterministico
+
+Nel Trade Log vengono mostrate:
+- `Candidati giorno`
+- `Rank giorno`
+
+In questo modo è possibile verificare perché uno specifico trade è stato scelto.
