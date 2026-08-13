@@ -625,3 +625,21 @@ Aggiunta colonna `Candela T-1`:
 
 T-1 significa ultima vera seduta precedente alla data analizzata, non
 semplicemente il giorno di calendario precedente.
+
+
+## V4.7.1 — Fix Cost Stress
+
+Corretto il `NameError: build_cost_stress_table is not defined`.
+
+Sono state ripristinate/verificate:
+- `apply_cost_r_to_oos`
+- `build_cost_stress_table`
+- `cost_break_even_r`
+- livelli Cost Stress: 0 / 0,01 / 0,02 / 0,03 / 0,05 / 0,10 R
+
+Nessuna modifica alla logica:
+- optimizer 1152 configurazioni
+- OFF vs CANDELA T-1 ALIGN
+- LONG+SHORT fisso
+- Asset Gate training-only
+- Candela T-1 nello screener settimanale

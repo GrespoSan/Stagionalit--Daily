@@ -2412,6 +2412,83 @@ def run_optimizer_walkforward(
 
 
 
+
+COST_STRESS_LEVELS_R = [0.00, 0.01, 0.02, 0.03, 0.05, 0.10]
+
+
+def apply_cost_r_to_oos(oos_trades: pd.DataFrame, cost_r: float) -> pd.DataFrame:
+    """
+    Sottrae un costo round-trip costante espresso in R a ogni trade valutabile.
+    I trade NO DATI restano esclusi perché R è NaN.
+    """
+    if oos_trades is None or oos_trades.empty:
+        return pd.DataFrame()
+
+    net = oos_trades.copy()
+    net["R lordo"] = net["R"]
+
+    valid_mask = net["R"].notna()
+    net["Costo R"] = np.nan
+    net.loc[valid_mask, "Costo R"] = float(cost_r)
+    net.loc[valid_mask, "R"] = (
+        pd.to_numeric(net.loc[valid_mask, "R"], errors="coerce")
+        - float(cost_r)
+    )
+
+    return net
+
+
+def build_cost_stress_table(
+    oos_trades: pd.DataFrame,
+    levels: list[float] | None = None,
+) -> pd.DataFrame:
+    """
+    Ricalcola le metriche OOS dopo l'applicazione di costi uniformi in R.
+    """
+    if levels is None:
+        levels = COST_STRESS_LEVELS_R
+
+    gross = optimizer_metrics(oos_trades)
+    rows = []
+
+    for cost in levels:
+        net_trades = apply_cost_r_to_oos(oos_trades, float(cost))
+        m = optimizer_metrics(net_trades)
+
+        rows.append({
+            "Costo R/trade": float(cost),
+            "Trade": m["valid"],
+            "NO DATI": m["no_data"],
+            "Win Rate netto": m["win_rate"],
+            "Profit Factor netto": m["profit_factor"],
+            "Expectancy netta R": m["expectancy_r"],
+            "Totale netto R": m["total_r"],
+            "Max DD netto R": m["max_dd_r"],
+            "Anni +": m["positive_years"],
+            "Anni": m["years"],
+            "% anni +": m["positive_year_ratio"],
+            "Delta Totale vs lordo R": (
+                m["total_r"] - gross["total_r"]
+                if not pd.isna(m["total_r"])
+                and not pd.isna(gross["total_r"])
+                else np.nan
+            ),
+        })
+
+    return pd.DataFrame(rows)
+
+
+def cost_break_even_r(oos_trades: pd.DataFrame) -> float:
+    """
+    Con un costo costante per trade, il break-even coincide con
+    l'Expectancy OOS lorda per trade.
+    """
+    m = optimizer_metrics(oos_trades)
+    if pd.isna(m["expectancy_r"]):
+        return np.nan
+    return float(m["expectancy_r"])
+
+
 def build_optimizer_excel_report(
     full_df: pd.DataFrame,
     folds_df: pd.DataFrame,
@@ -2441,7 +2518,7 @@ def build_optimizer_excel_report(
             ["Anni OOS totali", oos["years"]],
             ["% anni OOS positivi", oos["positive_year_ratio"]],
             ["Costo break-even per trade (R)", break_even_cost_r],
-            ["V4.7 EDGE FORTE", "PASS" if edge_v["pass"] else "FAIL"],
+            ["V4.7.1 EDGE FORTE", "PASS" if edge_v["pass"] else "FAIL"],
             ["OOS Totale R / Max DD", edge_v["rdd"]],
         ],
         columns=["Metrica", "Valore"],
@@ -2770,7 +2847,7 @@ def render_optimizer_results(
         )
 
     # ---------------- Verdetto Edge ----------------
-    st.subheader("Verdetto statistico V4.7")
+    st.subheader("Verdetto statistico V4.7.1")
     edge_v = edge_strength_verdict(oos_trades)
 
     if edge_v["pass"]:
@@ -2870,7 +2947,7 @@ def render_optimizer_results(
         st.dataframe(stab, width="stretch", hide_index=True)
 
     st.info(
-        "Interpretazione V4.7: il ranking privilegia robustezza annuale e plateau "
+        "Interpretazione V4.7.1: il ranking privilegia robustezza annuale e plateau "
         "di configurazioni vicine, non il massimo di expectancy. La tabella full-period "
         "resta IN-SAMPLE; il dato decisivo continua a essere l'OUT-OF-SAMPLE Walk-Forward. "
         "Se l'OOS non resta positivo, la strategia non è robusta anche se il Robust Score è alto."
@@ -3131,7 +3208,7 @@ with st.sidebar:
 
     run_backtest = st.button("Esegui backtest", type="secondary", width="stretch")
     st.caption(
-        "Motore V4.7 Edge Search Slim: storici, ATR, stagionalità ed EMA SPX "
+        "Motore V4.7.1 Edge Search Slim: storici, ATR, stagionalità ed EMA SPX "
         "vengono precalcolati e riutilizzati durante il backtest."
     )
 
