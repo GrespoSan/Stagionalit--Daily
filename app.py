@@ -1300,6 +1300,15 @@ OPT_STRENGTHS = ["MEDIO+", "BUONO+", "SOLO BUONO", "SOLO FORTE"]
 OPT_STOPS = [0.30, 0.40, 0.50, 0.60, 0.75, 1.00]
 OPT_COVERAGE = 0.60
 
+# V4.5: ricerca strutturale controllata, senza esplodere la griglia.
+OPT_TREND_MODES = ["OFF", "EMA21 ALIGN"]
+OPT_DIRECTION_MODES = ["LONG+SHORT", "SOLO LONG"]
+
+# Asset Gate: appreso SOLO sul training del fold.
+ASSET_GATE_MIN_TRADES = 6
+ASSET_GATE_MIN_PF = 1.05
+ASSET_GATE_MIN_ASSETS = 3
+
 
 def optimizer_strength_mask(values: pd.Series, label: str) -> pd.Series:
     x = pd.to_numeric(values, errors="coerce")
@@ -1356,8 +1365,11 @@ def build_optimizer_base(
                 grp["Return"].to_numpy(dtype=float),
             )
 
-        # ATR(T-1) per tutti i periodi della griglia.
+        # Indicatori noti PRIMA dell'Open del giorno target.
         prev_close = df["Close"].shift(1)
+        ema21_prev = df["Close"].ewm(span=21, adjust=False).mean().shift(1)
+
+        # ATR(T-1) per tutti i periodi della griglia.
         tr = pd.concat(
             [
                 df["High"] - df["Low"],
@@ -1405,6 +1417,7 @@ def build_optimizer_base(
                 "Low": float(df.at[dt, "Low"]) if not pd.isna(df.at[dt, "Low"]) else np.nan,
                 "Close": float(df.at[dt, "Close"]) if not pd.isna(df.at[dt, "Close"]) else np.nan,
                 "Prev Close": float(prev_close.loc[dt]) if not pd.isna(prev_close.loc[dt]) else np.nan,
+                "EMA21 Prev": float(ema21_prev.loc[dt]) if not pd.isna(ema21_prev.loc[dt]) else np.nan,
                 "Target %": target_pct,
                 "L10": stats[10]["long_prob"],
                 "L15": stats[15]["long_prob"],
@@ -1434,26 +1447,28 @@ def build_optimizer_base(
     return base, errors
 
 
-def optimizer_select_daily_trades(
+def optimizer_candidate_pool(
     base: pd.DataFrame,
     threshold_pct: int,
     atr_period: int,
     strength: str,
+    trend_mode: str = "OFF",
+    direction_mode: str = "LONG+SHORT",
 ) -> pd.DataFrame:
     """
-    Applica:
-    - copertura minima 60% fissa
-    - threshold stagionale
-    - forza movimento
-    - ranking ex-ante
-    - massimo 1 trade al giorno
+    Crea TUTTI i candidati validi prima del ranking giornaliero.
+
+    V4.5 aggiunge due filtri strutturali:
+    - EMA21 ALIGN: LONG solo sopra EMA21(T-1), SHORT solo sotto EMA21(T-1)
+    - SOLO LONG: esclude tutti gli SHORT
+
+    Nessun dato della seduta target viene usato per questi filtri.
     """
     if base.empty:
         return pd.DataFrame()
 
     x = base.copy()
 
-    # Copertura fissa 60% sulle tre finestre.
     coverage_mask = (
         (x["N10"] / 10 >= OPT_COVERAGE)
         & (x["N15"] / 15 >= OPT_COVERAGE)
@@ -1485,6 +1500,22 @@ def optimizer_select_daily_trades(
     if x.empty:
         return x
 
+    # Filtro direzione.
+    if direction_mode == "SOLO LONG":
+        x = x[x["Bias"] == "LONG"].copy()
+        if x.empty:
+            return x
+
+    # Filtro trend sull'UNDERLYING, usando esclusivamente T-1.
+    if trend_mode == "EMA21 ALIGN":
+        trend_ok = (
+            ((x["Bias"] == "LONG") & (x["Prev Close"] > x["EMA21 Prev"]))
+            | ((x["Bias"] == "SHORT") & (x["Prev Close"] < x["EMA21 Prev"]))
+        )
+        x = x[trend_ok & x["EMA21 Prev"].notna()].copy()
+        if x.empty:
+            return x
+
     x["Score"] = np.where(
         x["Bias"] == "LONG",
         x[["L10", "L15", "L20"]].mean(axis=1),
@@ -1506,7 +1537,34 @@ def optimizer_select_daily_trades(
     if x.empty:
         return x
 
-    # Ranking noto prima dell'entry.
+    x["Threshold"] = int(threshold_pct)
+    x["ATR period"] = int(atr_period)
+    x["Forza"] = strength
+    x["Trend"] = trend_mode
+    x["Direzione"] = direction_mode
+
+    return x.reset_index(drop=True)
+
+
+def optimizer_select_daily_from_pool(
+    pool: pd.DataFrame,
+    allowed_assets: list[str] | None = None,
+) -> pd.DataFrame:
+    """
+    Applica l'eventuale whitelist asset PRIMA del ranking e poi sceglie
+    massimo 1 trade al giorno.
+    """
+    if pool is None or pool.empty:
+        return pd.DataFrame()
+
+    x = pool.copy()
+
+    if allowed_assets is not None:
+        allowed = set(allowed_assets)
+        x = x[x["Asset"].isin(allowed)].copy()
+        if x.empty:
+            return x
+
     daily_counts = x.groupby("Date").size()
     x["Candidati giorno"] = x["Date"].map(daily_counts)
 
@@ -1517,11 +1575,28 @@ def optimizer_select_daily_trades(
     x["Rank giorno"] = x.groupby("Date").cumcount() + 1
     x = x[x["Rank giorno"] == 1].copy()
 
-    x["Threshold"] = int(threshold_pct)
-    x["ATR period"] = int(atr_period)
-    x["Forza"] = strength
-
     return x.reset_index(drop=True)
+
+
+def optimizer_select_daily_trades(
+    base: pd.DataFrame,
+    threshold_pct: int,
+    atr_period: int,
+    strength: str,
+    trend_mode: str = "OFF",
+    direction_mode: str = "LONG+SHORT",
+) -> pd.DataFrame:
+    """Wrapper compatibile: costruisce pool e applica ranking giornaliero."""
+    pool = optimizer_candidate_pool(
+        base=base,
+        threshold_pct=threshold_pct,
+        atr_period=atr_period,
+        strength=strength,
+        trend_mode=trend_mode,
+        direction_mode=direction_mode,
+    )
+    return optimizer_select_daily_from_pool(pool)
+
 
 
 def optimizer_evaluate_stop(
@@ -1614,6 +1689,118 @@ def optimizer_evaluate_stop(
     x["Stop ATR"] = float(stop_atr)
 
     return x
+
+
+
+def asset_training_whitelist(
+    pool: pd.DataFrame,
+    stop_atr: float,
+    train_start: date,
+    train_end: date,
+) -> tuple[list[str], pd.DataFrame]:
+    """
+    Valuta ogni asset separatamente SOLO sul training.
+    Un asset è ammesso se ha:
+    - almeno 6 trade valutabili;
+    - expectancy > 0;
+    - PF >= 1.05.
+
+    Questo filtro NON guarda mai l'anno OOS.
+    """
+    if pool is None or pool.empty:
+        return [], pd.DataFrame()
+
+    evaluated = optimizer_evaluate_stop(
+        selected=pool,
+        stop_atr=stop_atr,
+        start_date=train_start,
+        end_date=train_end,
+    )
+    if evaluated.empty:
+        return [], pd.DataFrame()
+
+    rows = []
+    for asset, grp in evaluated.groupby("Asset"):
+        m = optimizer_metrics(grp)
+        rows.append({
+            "Asset": asset,
+            "Trade": m["valid"],
+            "PF": m["profit_factor"],
+            "Expectancy R": m["expectancy_r"],
+            "Totale R": m["total_r"],
+        })
+
+    asset_df = pd.DataFrame(rows)
+    if asset_df.empty:
+        return [], asset_df
+
+    eligible = asset_df[
+        (asset_df["Trade"] >= ASSET_GATE_MIN_TRADES)
+        & (asset_df["Expectancy R"] > 0)
+        & (asset_df["PF"] >= ASSET_GATE_MIN_PF)
+    ].copy()
+
+    whitelist = sorted(eligible["Asset"].tolist())
+    return whitelist, asset_df
+
+
+def choose_training_asset_gate(
+    pool: pd.DataFrame,
+    stop_atr: float,
+    train_start: date,
+    train_end: date,
+) -> tuple[str, list[str], dict, dict]:
+    """
+    Decide sul training se usare o no la whitelist.
+
+    Il gate viene attivato solo se:
+    - restano almeno 3 asset;
+    - il numero trade non scende sotto il 50% del baseline;
+    - PF ed expectancy migliorano;
+    - il totale R resta positivo.
+    """
+    baseline_selected = optimizer_select_daily_from_pool(pool)
+    baseline_trades = optimizer_evaluate_stop(
+        baseline_selected, stop_atr, train_start, train_end
+    )
+    baseline = optimizer_metrics(baseline_trades)
+
+    whitelist, _ = asset_training_whitelist(
+        pool=pool,
+        stop_atr=stop_atr,
+        train_start=train_start,
+        train_end=train_end,
+    )
+
+    if len(whitelist) < ASSET_GATE_MIN_ASSETS:
+        return "OFF", [], baseline, {}
+
+    gated_selected = optimizer_select_daily_from_pool(
+        pool,
+        allowed_assets=whitelist,
+    )
+    gated_trades = optimizer_evaluate_stop(
+        gated_selected, stop_atr, train_start, train_end
+    )
+    gated = optimizer_metrics(gated_trades)
+
+    min_required = max(15, int(0.50 * max(baseline["valid"], 1)))
+    use_gate = (
+        gated["valid"] >= min_required
+        and not pd.isna(gated["expectancy_r"])
+        and not pd.isna(gated["profit_factor"])
+        and not pd.isna(baseline["expectancy_r"])
+        and not pd.isna(baseline["profit_factor"])
+        and gated["expectancy_r"] > baseline["expectancy_r"]
+        and gated["profit_factor"] >= baseline["profit_factor"]
+        and gated["total_r"] > 0
+    )
+
+    if use_gate:
+        return "TRAIN ROBUST", whitelist, baseline, gated
+
+    return "OFF", [], baseline, gated
+
 
 
 def optimizer_metrics(trades: pd.DataFrame) -> dict:
@@ -1741,11 +1928,11 @@ def optimizer_metric_row(
 
 def add_plateau_metrics(df: pd.DataFrame) -> pd.DataFrame:
     """
-    Misura quanto una configurazione è circondata da configurazioni vicine
-    che restano profittevoli.
+    Misura il plateau tra configurazioni vicine.
 
-    Vicino = un solo passo di griglia in UNA sola dimensione:
-    filtro, ATR, Forza oppure Stop.
+    Nella V4.5 Trend e Direzione sono dimensioni strutturali:
+    i vicini cambiano di un solo passo filtro/ATR/Forza/Stop mantenendo
+    INVARIATI Trend e Direzione.
     """
     if df is None or df.empty:
         return df.copy()
@@ -1757,13 +1944,20 @@ def add_plateau_metrics(df: pd.DataFrame) -> pd.DataFrame:
     strength_vals = list(OPT_STRENGTHS)
     stop_vals = [round(float(v), 2) for v in OPT_STOPS]
 
+    has_structural = "Trend" in out.columns and "Direzione" in out.columns
+
     key_to_idx = {}
     for i, row in out.iterrows():
-        key = (
+        base_key = (
             int(row["Filtro %"]),
             int(row["ATR"]),
             str(row["Forza"]),
             round(float(row["Stop ATR"]), 2),
+        )
+        key = (
+            base_key + (str(row["Trend"]), str(row["Direzione"]))
+            if has_structural
+            else base_key
         )
         key_to_idx[key] = i
 
@@ -1774,18 +1968,23 @@ def add_plateau_metrics(df: pd.DataFrame) -> pd.DataFrame:
     med_worst_list = []
 
     for _, row in out.iterrows():
-        key = (
+        base_key = (
             int(row["Filtro %"]),
             int(row["ATR"]),
             str(row["Forza"]),
             round(float(row["Stop ATR"]), 2),
         )
+        structural = (
+            (str(row["Trend"]), str(row["Direzione"]))
+            if has_structural
+            else ()
+        )
 
         positions = [
-            th_vals.index(key[0]),
-            atr_vals.index(key[1]),
-            strength_vals.index(key[2]),
-            stop_vals.index(key[3]),
+            th_vals.index(base_key[0]),
+            atr_vals.index(base_key[1]),
+            strength_vals.index(base_key[2]),
+            stop_vals.index(base_key[3]),
         ]
         grids = [th_vals, atr_vals, strength_vals, stop_vals]
 
@@ -1794,9 +1993,9 @@ def add_plateau_metrics(df: pd.DataFrame) -> pd.DataFrame:
             for delta in (-1, 1):
                 p = positions[dim] + delta
                 if 0 <= p < len(grids[dim]):
-                    nk = list(key)
+                    nk = list(base_key)
                     nk[dim] = grids[dim][p]
-                    nk = tuple(nk)
+                    nk = tuple(nk) + structural
                     if nk in key_to_idx:
                         neighbor_indices.append(key_to_idx[nk])
 
@@ -1820,7 +2019,11 @@ def add_plateau_metrics(df: pd.DataFrame) -> pd.DataFrame:
             float(pd.to_numeric(ndf["Expectancy R"], errors="coerce").median())
         )
         med_pf_list.append(
-            float(pd.to_numeric(ndf["Profit Factor"], errors="coerce").replace([np.inf, -np.inf], np.nan).median())
+            float(
+                pd.to_numeric(
+                    ndf["Profit Factor"], errors="coerce"
+                ).replace([np.inf, -np.inf], np.nan).median()
+            )
         )
         med_worst_list.append(
             float(pd.to_numeric(ndf["Peggior anno R"], errors="coerce").median())
@@ -1832,6 +2035,7 @@ def add_plateau_metrics(df: pd.DataFrame) -> pd.DataFrame:
     out["PF vicini mediana"] = med_pf_list
     out["Peggior anno vicini mediana"] = med_worst_list
     return out
+
 
 
 def add_robust_score(df: pd.DataFrame) -> pd.DataFrame:
@@ -1904,11 +2108,20 @@ def run_optimizer_walkforward(
     min_positive_year_ratio: float,
 ) -> tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame, pd.DataFrame, list]:
     """
-    1) Precalcola i candidati per 96 combinazioni:
-       threshold × ATR × forza.
-    2) Applica i 6 stop => 576 configurazioni.
-    3) Mostra classifica full-period SOLO esplorativa.
-    4) Walk-forward rolling: N anni train -> anno successivo OOS.
+    V4.5 EDGE SEARCH.
+
+    Griglia base:
+      4 threshold × 6 ATR × 4 Forza × 6 Stop = 576
+
+    Ricerca strutturale controllata:
+      × 2 Trend (OFF / EMA21 ALIGN)
+      × 2 Direzione (LONG+SHORT / SOLO LONG)
+
+    Totale = 2304 configurazioni.
+
+    Asset Gate NON aggiunge una dimensione ottimizzata:
+    viene deciso ex-ante, sul training, solo DOPO la selezione della
+    configurazione robusta del fold.
     """
     base, errors = build_optimizer_base(
         universe=universe,
@@ -1922,34 +2135,45 @@ def run_optimizer_walkforward(
     status = st.empty()
     progress = st.progress(0)
 
-    # 96 selezioni giornaliere, riusate per tutti gli stop e tutti i fold.
+    pool_cache = {}
     selected_cache = {}
+
     signal_configs = [
-        (th, atr, strength)
+        (th, atr, strength, trend_mode, direction_mode)
         for th in OPT_THRESHOLDS
         for atr in OPT_ATR_PERIODS
         for strength in OPT_STRENGTHS
+        for trend_mode in OPT_TREND_MODES
+        for direction_mode in OPT_DIRECTION_MODES
     ]
 
-    for i, (th, atr, strength) in enumerate(signal_configs, start=1):
+    for i, (th, atr, strength, trend_mode, direction_mode) in enumerate(signal_configs, start=1):
         status.write(
-            f"Ottimizzatore — segnali {i}/{len(signal_configs)} "
-            f"(Filtro {th} · ATR{atr} · {strength})"
+            f"Edge Search — segnali {i}/{len(signal_configs)} · "
+            f"{th}% · ATR{atr} · {strength} · {trend_mode} · {direction_mode}"
         )
-        selected_cache[(th, atr, strength)] = optimizer_select_daily_trades(
+        pool = optimizer_candidate_pool(
             base=base,
             threshold_pct=th,
             atr_period=atr,
             strength=strength,
+            trend_mode=trend_mode,
+            direction_mode=direction_mode,
         )
-        progress.progress(0.25 * i / len(signal_configs))
+        key = (th, atr, strength, trend_mode, direction_mode)
+        pool_cache[key] = pool
+        selected_cache[key] = optimizer_select_daily_from_pool(pool)
+        progress.progress(0.20 * i / len(signal_configs))
 
-    # Classifica full-period.
+    # ---------------- Full-period esplorativo ----------------
     full_rows = []
     total_full = len(signal_configs) * len(OPT_STOPS)
     count = 0
-    for th, atr, strength in signal_configs:
-        selected = selected_cache[(th, atr, strength)]
+
+    for th, atr, strength, trend_mode, direction_mode in signal_configs:
+        key = (th, atr, strength, trend_mode, direction_mode)
+        selected = selected_cache[key]
+
         for stop in OPT_STOPS:
             count += 1
             row, _ = optimizer_metric_row(
@@ -1961,18 +2185,21 @@ def run_optimizer_walkforward(
                 start_date=start_date,
                 end_date=end_date,
             )
+            row["Trend"] = trend_mode
+            row["Direzione"] = direction_mode
             full_rows.append(row)
-            if count % 20 == 0 or count == total_full:
+
+            if count % 50 == 0 or count == total_full:
                 status.write(
-                    f"Ottimizzatore — classifica full-period {count}/{total_full}"
+                    f"Edge Search — full-period {count}/{total_full}"
                 )
-                progress.progress(0.25 + 0.25 * count / total_full)
+                progress.progress(0.20 + 0.20 * count / total_full)
 
     full_df = pd.DataFrame(full_rows)
     full_df = add_plateau_metrics(full_df)
     full_df = add_robust_score(full_df)
 
-    # Walk-forward rolling per anno.
+    # ---------------- Walk-forward ----------------
     start_year = start_date.year
     end_year = end_date.year
     test_years = list(range(start_year + int(train_years), end_year + 1))
@@ -1980,7 +2207,6 @@ def run_optimizer_walkforward(
     fold_rows = []
     oos_trade_frames = []
     chosen_rows = []
-
     total_folds = max(len(test_years), 1)
 
     for fold_i, test_year in enumerate(test_years, start=1):
@@ -1994,14 +2220,16 @@ def run_optimizer_walkforward(
             continue
 
         status.write(
-            f"Walk-forward {fold_i}/{total_folds}: "
+            f"Edge Search Walk-Forward {fold_i}/{total_folds}: "
             f"train {train_start.year}-{train_end.year} → test {test_year}"
         )
 
-        train_candidates = []
+        train_rows = []
 
-        for th, atr, strength in signal_configs:
-            selected = selected_cache[(th, atr, strength)]
+        for th, atr, strength, trend_mode, direction_mode in signal_configs:
+            key = (th, atr, strength, trend_mode, direction_mode)
+            selected = selected_cache[key]
+
             for stop in OPT_STOPS:
                 row, _ = optimizer_metric_row(
                     selected=selected,
@@ -2012,9 +2240,11 @@ def run_optimizer_walkforward(
                     start_date=train_start,
                     end_date=train_end,
                 )
-                train_candidates.append(row)
+                row["Trend"] = trend_mode
+                row["Direzione"] = direction_mode
+                train_rows.append(row)
 
-        train_df = pd.DataFrame(train_candidates)
+        train_df = pd.DataFrame(train_rows)
         train_df = add_plateau_metrics(train_df)
         train_df = add_robust_score(train_df)
 
@@ -2026,29 +2256,26 @@ def run_optimizer_walkforward(
             & (train_df["Vicini"] >= 3)
         ].copy()
 
-        selection_rule = "ROBUST: criteri completi + plateau"
+        selection_rule = "EDGE: robust + plateau + trend/direction"
 
-        # Fallback trasparente: resta robust-oriented, ma allenta i filtri.
         if eligible.empty:
             eligible = train_df[
                 (train_df["Trade"] >= int(min_train_trades))
                 & (train_df["Expectancy R"] > 0)
                 & (train_df["Vicini"] >= 3)
             ].copy()
-            selection_rule = "ROBUST fallback: trade minimi + expectancy positiva"
+            selection_rule = "EDGE fallback: trade minimi + expectancy positiva"
 
         if eligible.empty:
             eligible = train_df[
                 (train_df["Trade"] >= max(10, int(min_train_trades // 2)))
                 & (train_df["Vicini"] >= 2)
             ].copy()
-            selection_rule = "ROBUST fallback: campione minimo ridotto"
+            selection_rule = "EDGE fallback: campione minimo ridotto"
 
         if eligible.empty:
             continue
 
-        # La scelta NON è più il massimo di expectancy.
-        # Prima Robust Score, poi stabilità annuale e solo dopo performance.
         eligible = eligible.sort_values(
             [
                 "Robust Score",
@@ -2064,27 +2291,53 @@ def run_optimizer_walkforward(
         )
 
         best = eligible.iloc[0]
+
         key = (
             int(best["Filtro %"]),
             int(best["ATR"]),
             str(best["Forza"]),
+            str(best["Trend"]),
+            str(best["Direzione"]),
         )
         stop = float(best["Stop ATR"])
-        selected = selected_cache[key]
+        pool = pool_cache[key]
 
-        test_row, test_trades = optimizer_metric_row(
-            selected=selected,
+        # Asset Gate deciso ESCLUSIVAMENTE sul training.
+        asset_gate, whitelist, baseline_train, gated_train = choose_training_asset_gate(
+            pool=pool,
             stop_atr=stop,
-            threshold=key[0],
-            atr_period=key[1],
-            strength=key[2],
+            train_start=train_start,
+            train_end=train_end,
+        )
+
+        # Selezione OOS: whitelist applicata PRIMA del ranking giornaliero.
+        test_pool = pool[
+            (pool["Date"] >= test_start)
+            & (pool["Date"] <= test_end)
+        ].copy()
+
+        selected_test = optimizer_select_daily_from_pool(
+            test_pool,
+            allowed_assets=whitelist if asset_gate == "TRAIN ROBUST" else None,
+        )
+
+        test_trades = optimizer_evaluate_stop(
+            selected=selected_test,
+            stop_atr=stop,
             start_date=test_start,
             end_date=test_end,
         )
+        test_metrics = optimizer_metrics(test_trades)
 
         if not test_trades.empty:
             test_trades = test_trades.copy()
             test_trades["Test Year"] = test_year
+            test_trades["Asset Gate"] = asset_gate
+            test_trades["Asset whitelist"] = (
+                " | ".join(whitelist)
+                if asset_gate == "TRAIN ROBUST"
+                else "ALL"
+            )
             oos_trade_frames.append(test_trades)
 
         fold_rows.append({
@@ -2093,7 +2346,11 @@ def run_optimizer_walkforward(
             "Filtro %": key[0],
             "ATR": key[1],
             "Forza": key[2],
+            "Trend": key[3],
+            "Direzione": key[4],
             "Stop ATR": stop,
+            "Asset Gate": asset_gate,
+            "Asset whitelist": " | ".join(whitelist) if whitelist else "ALL",
             "Regola selezione": selection_rule,
             "Robust Score": best["Robust Score"],
             "Train Trade": int(best["Trade"]),
@@ -2106,27 +2363,35 @@ def run_optimizer_walkforward(
             "Train Dispersione anni R": best["Dispersione anni R"],
             "Train % vicini positivi": best["% vicini positivi"],
             "Train Exp vicini mediana": best["Exp vicini mediana"],
-            "Test Trade": int(test_row["Trade"]),
-            "Test NO DATI": int(test_row["NO DATI"]),
-            "Test Win Rate": test_row["Win Rate"],
-            "Test PF": test_row["Profit Factor"],
-            "Test Exp R": test_row["Expectancy R"],
-            "Test Tot R": test_row["Totale R"],
-            "Test DD R": test_row["Max DD R"],
+            "Gate Train PF base": baseline_train.get("profit_factor", np.nan),
+            "Gate Train Exp base": baseline_train.get("expectancy_r", np.nan),
+            "Gate Train PF filtrato": gated_train.get("profit_factor", np.nan) if gated_train else np.nan,
+            "Gate Train Exp filtrata": gated_train.get("expectancy_r", np.nan) if gated_train else np.nan,
+            "Test Trade": int(test_metrics["valid"]),
+            "Test NO DATI": int(test_metrics["no_data"]),
+            "Test Win Rate": test_metrics["win_rate"],
+            "Test PF": test_metrics["profit_factor"],
+            "Test Exp R": test_metrics["expectancy_r"],
+            "Test Tot R": test_metrics["total_r"],
+            "Test DD R": test_metrics["max_dd_r"],
         })
 
         chosen_rows.append({
             "Filtro %": key[0],
             "ATR": key[1],
             "Forza": key[2],
+            "Trend": key[3],
+            "Direzione": key[4],
             "Stop ATR": stop,
+            "Asset Gate": asset_gate,
+            "Asset whitelist": " | ".join(whitelist) if whitelist else "ALL",
             "Robust Score": best["Robust Score"],
             "% vicini positivi": best["% vicini positivi"],
             "Mediana anno R": best["Mediana anno R"],
             "Peggior anno R": best["Peggior anno R"],
         })
 
-        progress.progress(0.50 + 0.50 * fold_i / total_folds)
+        progress.progress(0.40 + 0.60 * fold_i / total_folds)
 
     status.empty()
     progress.empty()
@@ -2144,83 +2409,6 @@ def run_optimizer_walkforward(
 
 
 
-
-COST_STRESS_LEVELS_R = [0.00, 0.01, 0.02, 0.03, 0.05, 0.10]
-
-
-def apply_cost_r_to_oos(oos_trades: pd.DataFrame, cost_r: float) -> pd.DataFrame:
-    """
-    Sottrae un costo round-trip costante espresso in R a ogni trade valutabile.
-    NO DATI resta escluso perché R è NaN.
-    """
-    if oos_trades is None or oos_trades.empty:
-        return pd.DataFrame()
-
-    net = oos_trades.copy()
-    net["R lordo"] = net["R"]
-    valid_mask = net["R"].notna()
-    net.loc[valid_mask, "Costo R"] = float(cost_r)
-    net.loc[~valid_mask, "Costo R"] = np.nan
-    net.loc[valid_mask, "R"] = (
-        pd.to_numeric(net.loc[valid_mask, "R"], errors="coerce")
-        - float(cost_r)
-    )
-    return net
-
-
-def build_cost_stress_table(
-    oos_trades: pd.DataFrame,
-    levels: list[float] | None = None,
-) -> pd.DataFrame:
-    """
-    Stress test dei costi sull'OUT-OF-SAMPLE.
-    Ricalcola tutte le metriche dopo aver sottratto il costo per trade.
-    """
-    if levels is None:
-        levels = COST_STRESS_LEVELS_R
-
-    rows = []
-    gross = optimizer_metrics(oos_trades)
-
-    for cost in levels:
-        net_trades = apply_cost_r_to_oos(oos_trades, float(cost))
-        m = optimizer_metrics(net_trades)
-
-        rows.append({
-            "Costo R/trade": float(cost),
-            "Trade": m["valid"],
-            "NO DATI": m["no_data"],
-            "Win Rate netto": m["win_rate"],
-            "Profit Factor netto": m["profit_factor"],
-            "Expectancy netta R": m["expectancy_r"],
-            "Totale netto R": m["total_r"],
-            "Max DD netto R": m["max_dd_r"],
-            "Anni +": m["positive_years"],
-            "Anni": m["years"],
-            "% anni +": m["positive_year_ratio"],
-            "Delta Totale vs lordo R": (
-                m["total_r"] - gross["total_r"]
-                if not pd.isna(m["total_r"]) and not pd.isna(gross["total_r"])
-                else np.nan
-            ),
-        })
-
-    return pd.DataFrame(rows)
-
-
-def cost_break_even_r(oos_trades: pd.DataFrame) -> float:
-    """
-    Con costo costante per trade, il costo di break-even sull'Expectancy
-    coincide con l'Expectancy OOS lorda.
-    """
-    m = optimizer_metrics(oos_trades)
-    return (
-        float(m["expectancy_r"])
-        if not pd.isna(m["expectancy_r"])
-        else np.nan
-    )
-
-
 def build_optimizer_excel_report(
     full_df: pd.DataFrame,
     folds_df: pd.DataFrame,
@@ -2233,6 +2421,7 @@ def build_optimizer_excel_report(
     oos = optimizer_metrics(oos_trades)
     cost_stress_df = build_cost_stress_table(oos_trades)
     break_even_cost_r = cost_break_even_r(oos_trades)
+    edge_v = edge_strength_verdict(oos_trades)
 
     summary_df = pd.DataFrame(
         [
@@ -2249,6 +2438,8 @@ def build_optimizer_excel_report(
             ["Anni OOS totali", oos["years"]],
             ["% anni OOS positivi", oos["positive_year_ratio"]],
             ["Costo break-even per trade (R)", break_even_cost_r],
+            ["V4.5 EDGE FORTE", "PASS" if edge_v["pass"] else "FAIL"],
+            ["OOS Totale R / Max DD", edge_v["rdd"]],
         ],
         columns=["Metrica", "Valore"],
     )
@@ -2259,7 +2450,7 @@ def build_optimizer_excel_report(
 
     if not chosen_df.empty:
         stability_rows = []
-        for col in ["Filtro %", "ATR", "Forza", "Stop ATR"]:
+        for col in ["Filtro %", "ATR", "Forza", "Trend", "Direzione", "Stop ATR", "Asset Gate"]:
             counts = chosen_df[col].value_counts(dropna=False)
             for value, count in counts.items():
                 stability_rows.append(
@@ -2280,7 +2471,7 @@ def build_optimizer_excel_report(
         datasets = [
             ("Riepilogo_OOS", summary_df),
             ("Impostazioni", settings_df),
-            ("Full_576", full_df),
+            ("Full_Edge_Search", full_df),
             ("Walk_Forward", folds_df),
             ("Parametri_Scelti", chosen_df),
             ("Stabilita", stability_df),
@@ -2403,6 +2594,47 @@ def build_optimizer_excel_report(
     return output.getvalue()
 
 
+
+def edge_strength_verdict(oos_trades: pd.DataFrame) -> dict:
+    """
+    Criteri volutamente severi: l'obiettivo V4.5 è trovare un edge forte,
+    non salvare una strategia marginale.
+    """
+    m = optimizer_metrics(oos_trades)
+
+    rdd = (
+        m["total_r"] / m["max_dd_r"]
+        if not pd.isna(m["total_r"])
+        and not pd.isna(m["max_dd_r"])
+        and m["max_dd_r"] > 0
+        else np.nan
+    )
+
+    checks = {
+        "Trade OOS ≥ 80": m["valid"] >= 80,
+        "Profit Factor ≥ 1,25": (
+            not pd.isna(m["profit_factor"]) and m["profit_factor"] >= 1.25
+        ),
+        "Expectancy ≥ +0,08R": (
+            not pd.isna(m["expectancy_r"]) and m["expectancy_r"] >= 0.08
+        ),
+        "Anni OOS positivi ≥ 70%": (
+            not pd.isna(m["positive_year_ratio"])
+            and m["positive_year_ratio"] >= 0.70
+        ),
+        "Totale R / Max DD ≥ 1,50": (
+            not pd.isna(rdd) and rdd >= 1.50
+        ),
+    }
+
+    return {
+        "pass": all(checks.values()),
+        "checks": checks,
+        "metrics": m,
+        "rdd": rdd,
+    }
+
+
 def render_optimizer_results(
     full_df: pd.DataFrame,
     folds_df: pd.DataFrame,
@@ -2414,9 +2646,11 @@ def render_optimizer_results(
     st.header("⚙️ Ottimizzatore automatico + Walk-Forward")
 
     st.caption(
-        "Griglia fissa: 4 filtri stagionali × 6 ATR × 4 classi Forza × "
-        "6 Stop = **576 configurazioni**. Regole fisse: 1 trade/giorno, "
-        "copertura campione 60%, LONG+SHORT, regime SPX OFF."
+        "V4.5 Edge Search: 4 filtri stagionali × 6 ATR × 4 Forza × 6 Stop × "
+        "2 regimi trend × 2 direzioni = **2304 configurazioni**. "
+        "Trend = OFF oppure allineamento EMA21 dell'underlying su T-1. "
+        "Direzione = LONG+SHORT oppure SOLO LONG. "
+        "L'Asset Gate viene appreso esclusivamente sul training del fold."
     )
 
     if full_df.empty:
@@ -2532,6 +2766,28 @@ def render_optimizer_results(
             f"({positive_test_years / total_test_years:.0%})**."
         )
 
+    # ---------------- Verdetto Edge ----------------
+    st.subheader("Verdetto statistico V4.5")
+    edge_v = edge_strength_verdict(oos_trades)
+
+    if edge_v["pass"]:
+        st.success(
+            "EDGE FORTE: tutti i criteri OOS minimi sono superati. "
+            "Solo in questo caso ha senso passare alla fase operativa/forward."
+        )
+    else:
+        st.error(
+            "EDGE NON SUFFICIENTEMENTE FORTE: almeno un criterio OOS non è superato. "
+            "Se questo resta il risultato dopo la V4.5, la strategia va fermata "
+            "o ripensata, non ulteriormente ottimizzata."
+        )
+
+    verdict_rows = [
+        {"Criterio": name, "Esito": "PASS" if ok else "FAIL"}
+        for name, ok in edge_v["checks"].items()
+    ]
+    st.dataframe(pd.DataFrame(verdict_rows), width="stretch", hide_index=True)
+
     # ---------------- Cost Stress Test ----------------
     st.subheader("Cost Stress Test — OUT-OF-SAMPLE")
 
@@ -2597,7 +2853,7 @@ def render_optimizer_results(
     if not chosen_df.empty:
         st.subheader("Stabilità dei parametri scelti nei fold")
         stability = []
-        for col in ["Filtro %", "ATR", "Forza", "Stop ATR"]:
+        for col in ["Filtro %", "ATR", "Forza", "Trend", "Direzione", "Stop ATR", "Asset Gate"]:
             counts = chosen_df[col].value_counts(dropna=False)
             for value, count in counts.items():
                 stability.append({
@@ -2611,7 +2867,7 @@ def render_optimizer_results(
         st.dataframe(stab, width="stretch", hide_index=True)
 
     st.info(
-        "Interpretazione V4.4: il ranking privilegia robustezza annuale e plateau "
+        "Interpretazione V4.5: il ranking privilegia robustezza annuale e plateau "
         "di configurazioni vicine, non il massimo di expectancy. La tabella full-period "
         "resta IN-SAMPLE; il dato decisivo continua a essere l'OUT-OF-SAMPLE Walk-Forward. "
         "Se l'OOS non resta positivo, la strategia non è robusta anche se il Robust Score è alto."
@@ -2825,7 +3081,7 @@ with st.sidebar:
 
     run_backtest = st.button("Esegui backtest", type="secondary", width="stretch")
     st.caption(
-        "Motore V4.4 robust/plateau + cost stress: storici, ATR, stagionalità ed EMA SPX "
+        "Motore V4.5 Edge Search: storici, ATR, stagionalità ed EMA SPX "
         "vengono precalcolati e riutilizzati durante il backtest."
     )
 
@@ -2879,9 +3135,9 @@ with st.sidebar:
         width="stretch",
     )
     st.caption(
-        "Griglia invariata: filtro 65/70/75/80 · ATR 3/5/7/10/14/20 · "
-        "MEDIO+/BUONO+/SOLO BUONO/SOLO FORTE · Stop 0.30/0.40/0.50/0.60/0.75/1.00. "
-        "La V4.3 seleziona per robustezza annuale + plateau. "
+        "V4.5 Edge Search: griglia base invariata + Trend OFF/EMA21 ALIGN "
+        "+ Direzione LONG+SHORT/SOLO LONG. Totale 2304 configurazioni. "
+        "L'Asset Gate elimina asset solo se deboli nel TRAINING, mai guardando l'OOS. "
         "Fissi: 1 trade/giorno, copertura 60%, SPX OFF."
     )
 
@@ -2997,7 +3253,10 @@ if run_optimizer:
         "ATR testati": "3, 5, 7, 10, 14, 20",
         "Forza testate": "MEDIO+, BUONO+, SOLO BUONO, SOLO FORTE",
         "Stop ATR testati": "0.30, 0.40, 0.50, 0.60, 0.75, 1.00",
-        "Numero configurazioni": 576,
+        "Trend testati": "OFF, EMA21 ALIGN",
+        "Direzioni testate": "LONG+SHORT, SOLO LONG",
+        "Asset Gate": "TRAIN ROBUST ex-ante, min 6 trade / PF 1.05 / Exp > 0 / min 3 asset",
+        "Numero configurazioni": 2304,
     }
 
     render_optimizer_results(

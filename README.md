@@ -521,3 +521,56 @@ foglio `Riepilogo_OOS`.
 
 Nota: lo stress test usa un costo uniforme espresso in R. Non sostituisce
 ancora il futuro modulo CFD/Turbo con costi specifici per strumento.
+
+
+## V4.5 — EDGE SEARCH (ultimo tentativo strutturale)
+
+Obiettivo: trovare un vantaggio statistico OOS chiaramente forte oppure fermare
+la strategia. Non vengono aggiunti indicatori casuali.
+
+### Ricerca strutturale
+
+Alla griglia base 576 vengono aggiunti soltanto:
+
+- Trend `OFF`
+- Trend `EMA21 ALIGN`
+  - LONG ammesso solo se Close(T-1) > EMA21(T-1)
+  - SHORT ammesso solo se Close(T-1) < EMA21(T-1)
+
+e:
+
+- `LONG+SHORT`
+- `SOLO LONG`
+
+Totale: 2304 configurazioni.
+
+### Asset Gate ex-ante
+
+Dopo che ogni fold sceglie la configurazione robusta sul training, l'app valuta
+gli asset separatamente sempre e solo sul training.
+
+Asset eleggibile:
+- almeno 6 trade valutabili
+- Profit Factor >= 1,05
+- Expectancy > 0
+
+Il gate viene usato solo se:
+- restano almeno 3 asset
+- i trade non scendono sotto il 50% del baseline
+- PF ed expectancy training migliorano
+- Total R training resta positivo
+
+La whitelist viene poi congelata e applicata all'anno OOS PRIMA del ranking
+giornaliero. Nessun asset viene escluso perché ha perso nell'OOS.
+
+### Criteri finali EDGE FORTE
+
+Per considerare il progetto valido devono essere superati TUTTI:
+- almeno 80 trade OOS
+- Profit Factor OOS >= 1,25
+- Expectancy OOS >= +0,08R
+- almeno 70% anni OOS positivi
+- Totale R / Max Drawdown >= 1,50
+
+Se la V4.5 non supera questi criteri, la raccomandazione è fermare o
+ridisegnare la strategia, non continuare ad aggiungere filtri.
