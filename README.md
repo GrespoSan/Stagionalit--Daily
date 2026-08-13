@@ -574,3 +574,28 @@ Per considerare il progetto valido devono essere superati TUTTI:
 
 Se la V4.5 non supera questi criteri, la raccomandazione è fermare o
 ridisegnare la strategia, non continuare ad aggiungere filtri.
+
+
+## V4.6 — Candela T-1 Align
+
+Aggiunta una terza modalità strutturale, alternativa alle precedenti:
+
+- `OFF`
+- `EMA21 ALIGN`
+- `CANDELA T-1 ALIGN`
+
+Regola `CANDELA T-1 ALIGN`:
+- LONG: Close(T-1) > Open(T-1)
+- SHORT: Close(T-1) < Open(T-1)
+- Doji: nessun trade
+
+L'entry resta sempre all'Open di T.
+
+La modalità candela NON viene combinata con EMA21: l'optimizer sceglie tra le
+tre alternative strutturali, evitando di impilare filtri.
+
+La griglia diventa:
+4 threshold × 6 ATR × 4 Forza × 6 Stop × 3 regimi × 2 direzioni
+= 3456 configurazioni.
+
+Asset Gate e criteri finali EDGE FORTE restano invariati.

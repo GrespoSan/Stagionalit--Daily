@@ -1301,7 +1301,7 @@ OPT_STOPS = [0.30, 0.40, 0.50, 0.60, 0.75, 1.00]
 OPT_COVERAGE = 0.60
 
 # V4.5: ricerca strutturale controllata, senza esplodere la griglia.
-OPT_TREND_MODES = ["OFF", "EMA21 ALIGN"]
+OPT_TREND_MODES = ["OFF", "EMA21 ALIGN", "CANDELA T-1 ALIGN"]
 OPT_DIRECTION_MODES = ["LONG+SHORT", "SOLO LONG"]
 
 # Asset Gate: appreso SOLO sul training del fold.
@@ -1367,6 +1367,7 @@ def build_optimizer_base(
 
         # Indicatori noti PRIMA dell'Open del giorno target.
         prev_close = df["Close"].shift(1)
+        prev_open = df["Open"].shift(1)
         ema21_prev = df["Close"].ewm(span=21, adjust=False).mean().shift(1)
 
         # ATR(T-1) per tutti i periodi della griglia.
@@ -1417,6 +1418,7 @@ def build_optimizer_base(
                 "Low": float(df.at[dt, "Low"]) if not pd.isna(df.at[dt, "Low"]) else np.nan,
                 "Close": float(df.at[dt, "Close"]) if not pd.isna(df.at[dt, "Close"]) else np.nan,
                 "Prev Close": float(prev_close.loc[dt]) if not pd.isna(prev_close.loc[dt]) else np.nan,
+                "Prev Open": float(prev_open.loc[dt]) if not pd.isna(prev_open.loc[dt]) else np.nan,
                 "EMA21 Prev": float(ema21_prev.loc[dt]) if not pd.isna(ema21_prev.loc[dt]) else np.nan,
                 "Target %": target_pct,
                 "L10": stats[10]["long_prob"],
@@ -1458,9 +1460,13 @@ def optimizer_candidate_pool(
     """
     Crea TUTTI i candidati validi prima del ranking giornaliero.
 
-    V4.5 aggiunge due filtri strutturali:
+    V4.6 confronta tre modalità strutturali alternative:
+    - OFF
     - EMA21 ALIGN: LONG solo sopra EMA21(T-1), SHORT solo sotto EMA21(T-1)
-    - SOLO LONG: esclude tutti gli SHORT
+    - CANDELA T-1 ALIGN: LONG solo dopo candela verde, SHORT solo dopo candela rossa
+      (doji = nessun trade)
+
+    La direzione può inoltre essere LONG+SHORT oppure SOLO LONG.
 
     Nessun dato della seduta target viene usato per questi filtri.
     """
@@ -1513,6 +1519,16 @@ def optimizer_candidate_pool(
             | ((x["Bias"] == "SHORT") & (x["Prev Close"] < x["EMA21 Prev"]))
         )
         x = x[trend_ok & x["EMA21 Prev"].notna()].copy()
+        if x.empty:
+            return x
+
+    if trend_mode == "CANDELA T-1 ALIGN":
+        candle_ok = (
+            ((x["Bias"] == "LONG") & (x["Prev Close"] > x["Prev Open"]))
+            | ((x["Bias"] == "SHORT") & (x["Prev Close"] < x["Prev Open"]))
+        )
+        # Se Open == Close la candela è doji: nessun trade.
+        x = x[candle_ok & x["Prev Open"].notna() & x["Prev Close"].notna()].copy()
         if x.empty:
             return x
 
@@ -2114,10 +2130,10 @@ def run_optimizer_walkforward(
       4 threshold × 6 ATR × 4 Forza × 6 Stop = 576
 
     Ricerca strutturale controllata:
-      × 2 Trend (OFF / EMA21 ALIGN)
+      × 3 Trend (OFF / EMA21 ALIGN / CANDELA T-1 ALIGN)
       × 2 Direzione (LONG+SHORT / SOLO LONG)
 
-    Totale = 2304 configurazioni.
+    Totale = 3456 configurazioni.
 
     Asset Gate NON aggiunge una dimensione ottimizzata:
     viene deciso ex-ante, sul training, solo DOPO la selezione della
@@ -2438,7 +2454,7 @@ def build_optimizer_excel_report(
             ["Anni OOS totali", oos["years"]],
             ["% anni OOS positivi", oos["positive_year_ratio"]],
             ["Costo break-even per trade (R)", break_even_cost_r],
-            ["V4.5 EDGE FORTE", "PASS" if edge_v["pass"] else "FAIL"],
+            ["V4.6 EDGE FORTE", "PASS" if edge_v["pass"] else "FAIL"],
             ["OOS Totale R / Max DD", edge_v["rdd"]],
         ],
         columns=["Metrica", "Valore"],
@@ -2646,9 +2662,9 @@ def render_optimizer_results(
     st.header("⚙️ Ottimizzatore automatico + Walk-Forward")
 
     st.caption(
-        "V4.5 Edge Search: 4 filtri stagionali × 6 ATR × 4 Forza × 6 Stop × "
-        "2 regimi trend × 2 direzioni = **2304 configurazioni**. "
-        "Trend = OFF oppure allineamento EMA21 dell'underlying su T-1. "
+        "V4.6 Edge Search: 4 filtri stagionali × 6 ATR × 4 Forza × 6 Stop × "
+        "3 regimi strutturali × 2 direzioni = **3456 configurazioni**. "
+        "Regime = OFF, EMA21 ALIGN oppure CANDELA T-1 ALIGN. "
         "Direzione = LONG+SHORT oppure SOLO LONG. "
         "L'Asset Gate viene appreso esclusivamente sul training del fold."
     )
@@ -2767,7 +2783,7 @@ def render_optimizer_results(
         )
 
     # ---------------- Verdetto Edge ----------------
-    st.subheader("Verdetto statistico V4.5")
+    st.subheader("Verdetto statistico V4.6")
     edge_v = edge_strength_verdict(oos_trades)
 
     if edge_v["pass"]:
@@ -2867,7 +2883,7 @@ def render_optimizer_results(
         st.dataframe(stab, width="stretch", hide_index=True)
 
     st.info(
-        "Interpretazione V4.5: il ranking privilegia robustezza annuale e plateau "
+        "Interpretazione V4.6: il ranking privilegia robustezza annuale e plateau "
         "di configurazioni vicine, non il massimo di expectancy. La tabella full-period "
         "resta IN-SAMPLE; il dato decisivo continua a essere l'OUT-OF-SAMPLE Walk-Forward. "
         "Se l'OOS non resta positivo, la strategia non è robusta anche se il Robust Score è alto."
@@ -3081,7 +3097,7 @@ with st.sidebar:
 
     run_backtest = st.button("Esegui backtest", type="secondary", width="stretch")
     st.caption(
-        "Motore V4.5 Edge Search: storici, ATR, stagionalità ed EMA SPX "
+        "Motore V4.6 Edge Search: storici, ATR, stagionalità ed EMA SPX "
         "vengono precalcolati e riutilizzati durante il backtest."
     )
 
@@ -3135,8 +3151,9 @@ with st.sidebar:
         width="stretch",
     )
     st.caption(
-        "V4.5 Edge Search: griglia base invariata + Trend OFF/EMA21 ALIGN "
-        "+ Direzione LONG+SHORT/SOLO LONG. Totale 2304 configurazioni. "
+        "V4.6 Edge Search: griglia base invariata + "
+        "OFF/EMA21 ALIGN/CANDELA T-1 ALIGN + Direzione LONG+SHORT/SOLO LONG. "
+        "Totale 3456 configurazioni. "
         "L'Asset Gate elimina asset solo se deboli nel TRAINING, mai guardando l'OOS. "
         "Fissi: 1 trade/giorno, copertura 60%, SPX OFF."
     )
@@ -3253,10 +3270,10 @@ if run_optimizer:
         "ATR testati": "3, 5, 7, 10, 14, 20",
         "Forza testate": "MEDIO+, BUONO+, SOLO BUONO, SOLO FORTE",
         "Stop ATR testati": "0.30, 0.40, 0.50, 0.60, 0.75, 1.00",
-        "Trend testati": "OFF, EMA21 ALIGN",
+        "Trend testati": "OFF, EMA21 ALIGN, CANDELA T-1 ALIGN",
         "Direzioni testate": "LONG+SHORT, SOLO LONG",
         "Asset Gate": "TRAIN ROBUST ex-ante, min 6 trade / PF 1.05 / Exp > 0 / min 3 asset",
-        "Numero configurazioni": 2304,
+        "Numero configurazioni": 3456,
     }
 
     render_optimizer_results(
