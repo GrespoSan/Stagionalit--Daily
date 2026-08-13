@@ -490,3 +490,34 @@ Il Walk-Forward non seleziona più la massima expectancy del training:
 ordina prima per Robust Score e stabilità annuale/plateau.
 
 Il giudizio finale resta esclusivamente OUT-OF-SAMPLE.
+
+
+## V4.4 — Cost Stress Test
+
+La logica di entry resta fissata sull'OPEN e il motore Robust/Plateau è invariato.
+
+Nuovo stress test sui soli trade OUT-OF-SAMPLE:
+- 0,00 R per trade
+- 0,01 R
+- 0,02 R
+- 0,03 R
+- 0,05 R
+- 0,10 R
+
+Per ogni livello vengono ricalcolati:
+- Win Rate netto
+- Profit Factor netto
+- Expectancy netta
+- Totale R netto
+- Max Drawdown netto
+- anni positivi
+- % anni positivi
+
+Viene inoltre calcolato il `Costo break-even per trade (R)`, cioè il costo
+round-trip uniforme che porta l'Expectancy OOS a circa zero.
+
+Il report Excel aggiunge il foglio `Cost_Stress` e il costo break-even nel
+foglio `Riepilogo_OOS`.
+
+Nota: lo stress test usa un costo uniforme espresso in R. Non sostituisce
+ancora il futuro modulo CFD/Turbo con costi specifici per strumento.

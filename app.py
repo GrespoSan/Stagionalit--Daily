@@ -2144,6 +2144,83 @@ def run_optimizer_walkforward(
 
 
 
+
+COST_STRESS_LEVELS_R = [0.00, 0.01, 0.02, 0.03, 0.05, 0.10]
+
+
+def apply_cost_r_to_oos(oos_trades: pd.DataFrame, cost_r: float) -> pd.DataFrame:
+    """
+    Sottrae un costo round-trip costante espresso in R a ogni trade valutabile.
+    NO DATI resta escluso perché R è NaN.
+    """
+    if oos_trades is None or oos_trades.empty:
+        return pd.DataFrame()
+
+    net = oos_trades.copy()
+    net["R lordo"] = net["R"]
+    valid_mask = net["R"].notna()
+    net.loc[valid_mask, "Costo R"] = float(cost_r)
+    net.loc[~valid_mask, "Costo R"] = np.nan
+    net.loc[valid_mask, "R"] = (
+        pd.to_numeric(net.loc[valid_mask, "R"], errors="coerce")
+        - float(cost_r)
+    )
+    return net
+
+
+def build_cost_stress_table(
+    oos_trades: pd.DataFrame,
+    levels: list[float] | None = None,
+) -> pd.DataFrame:
+    """
+    Stress test dei costi sull'OUT-OF-SAMPLE.
+    Ricalcola tutte le metriche dopo aver sottratto il costo per trade.
+    """
+    if levels is None:
+        levels = COST_STRESS_LEVELS_R
+
+    rows = []
+    gross = optimizer_metrics(oos_trades)
+
+    for cost in levels:
+        net_trades = apply_cost_r_to_oos(oos_trades, float(cost))
+        m = optimizer_metrics(net_trades)
+
+        rows.append({
+            "Costo R/trade": float(cost),
+            "Trade": m["valid"],
+            "NO DATI": m["no_data"],
+            "Win Rate netto": m["win_rate"],
+            "Profit Factor netto": m["profit_factor"],
+            "Expectancy netta R": m["expectancy_r"],
+            "Totale netto R": m["total_r"],
+            "Max DD netto R": m["max_dd_r"],
+            "Anni +": m["positive_years"],
+            "Anni": m["years"],
+            "% anni +": m["positive_year_ratio"],
+            "Delta Totale vs lordo R": (
+                m["total_r"] - gross["total_r"]
+                if not pd.isna(m["total_r"]) and not pd.isna(gross["total_r"])
+                else np.nan
+            ),
+        })
+
+    return pd.DataFrame(rows)
+
+
+def cost_break_even_r(oos_trades: pd.DataFrame) -> float:
+    """
+    Con costo costante per trade, il costo di break-even sull'Expectancy
+    coincide con l'Expectancy OOS lorda.
+    """
+    m = optimizer_metrics(oos_trades)
+    return (
+        float(m["expectancy_r"])
+        if not pd.isna(m["expectancy_r"])
+        else np.nan
+    )
+
+
 def build_optimizer_excel_report(
     full_df: pd.DataFrame,
     folds_df: pd.DataFrame,
@@ -2154,6 +2231,8 @@ def build_optimizer_excel_report(
     """Crea un unico report Excel con tutti i dati dell'ottimizzazione."""
     output = io.BytesIO()
     oos = optimizer_metrics(oos_trades)
+    cost_stress_df = build_cost_stress_table(oos_trades)
+    break_even_cost_r = cost_break_even_r(oos_trades)
 
     summary_df = pd.DataFrame(
         [
@@ -2169,6 +2248,7 @@ def build_optimizer_excel_report(
             ["Anni OOS positivi", oos["positive_years"]],
             ["Anni OOS totali", oos["years"]],
             ["% anni OOS positivi", oos["positive_year_ratio"]],
+            ["Costo break-even per trade (R)", break_even_cost_r],
         ],
         columns=["Metrica", "Valore"],
     )
@@ -2204,6 +2284,7 @@ def build_optimizer_excel_report(
             ("Walk_Forward", folds_df),
             ("Parametri_Scelti", chosen_df),
             ("Stabilita", stability_df),
+            ("Cost_Stress", cost_stress_df),
             ("Trade_OOS", oos_trades),
         ]
 
@@ -2284,6 +2365,12 @@ def build_optimizer_excel_report(
                         "Exp vicini",
                         "PF vicini",
                         "Robust Score",
+                        "Costo R/trade",
+                        "Expectancy netta",
+                        "Totale netto",
+                        "Max DD netto",
+                        "Delta Totale",
+                        "break-even",
                     ]
                 ):
                     cell_fmt = num2_fmt
@@ -2299,7 +2386,7 @@ def build_optimizer_excel_report(
         for row_idx, metric in enumerate(summary_df["Metrica"], start=1):
             if metric in {"Win Rate OOS", "% anni OOS positivi"}:
                 ws.write_number(row_idx, 1, float(summary_df.iloc[row_idx - 1, 1]), pct_fmt)
-            elif metric == "Expectancy OOS (R)" and pd.notna(summary_df.iloc[row_idx - 1, 1]):
+            elif metric in {"Expectancy OOS (R)", "Costo break-even per trade (R)"} and pd.notna(summary_df.iloc[row_idx - 1, 1]):
                 ws.write_number(row_idx, 1, float(summary_df.iloc[row_idx - 1, 1]), num3_fmt)
             elif metric in {
                 "Profit Factor OOS",
@@ -2445,6 +2532,58 @@ def render_optimizer_results(
             f"({positive_test_years / total_test_years:.0%})**."
         )
 
+    # ---------------- Cost Stress Test ----------------
+    st.subheader("Cost Stress Test — OUT-OF-SAMPLE")
+
+    cost_stress = build_cost_stress_table(oos_trades)
+    be_cost = cost_break_even_r(oos_trades)
+
+    if pd.isna(be_cost):
+        st.caption("Costo break-even non disponibile.")
+    else:
+        st.metric(
+            "Costo break-even per trade",
+            f"{be_cost:.3f} R",
+            help=(
+                "Con un costo round-trip costante espresso in R, è il costo medio "
+                "per trade che porta l'Expectancy OOS a circa zero."
+            ),
+        )
+
+    if not cost_stress.empty:
+        stress_disp = cost_stress.copy()
+        stress_disp["Costo R/trade"] = stress_disp["Costo R/trade"].map(
+            lambda x: f"{x:.2f} R"
+        )
+        stress_disp["Win Rate netto"] = stress_disp["Win Rate netto"].map(
+            lambda x: "n/d" if pd.isna(x) else f"{x:.1%}"
+        )
+        stress_disp["% anni +"] = stress_disp["% anni +"].map(
+            lambda x: "n/d" if pd.isna(x) else f"{x:.0%}"
+        )
+        for c in [
+            "Profit Factor netto",
+            "Expectancy netta R",
+            "Totale netto R",
+            "Max DD netto R",
+            "Delta Totale vs lordo R",
+        ]:
+            stress_disp[c] = stress_disp[c].map(
+                lambda x: "n/d"
+                if pd.isna(x)
+                else ("∞" if np.isinf(x) else f"{x:+.3f}" if "Expectancy" in c else f"{x:+.2f}")
+            )
+
+        st.dataframe(stress_disp, width="stretch", hide_index=True)
+
+    st.caption(
+        "Il costo è espresso in R e viene sottratto a ogni trade valutabile. "
+        "Esempio: 0,02R significa che spread + slippage + commissioni/finanziamento "
+        "assorbono complessivamente il 2% del rischio iniziale del trade. "
+        "Questo è uno stress test uniforme: nella realtà CFD e Turbo possono avere "
+        "costi diversi per asset e giornata."
+    )
+
     # Equity OOS
     valid_oos = oos_trades.dropna(subset=["R"]).copy() if not oos_trades.empty else pd.DataFrame()
     if not valid_oos.empty:
@@ -2472,7 +2611,7 @@ def render_optimizer_results(
         st.dataframe(stab, width="stretch", hide_index=True)
 
     st.info(
-        "Interpretazione V4.3: il ranking privilegia robustezza annuale e plateau "
+        "Interpretazione V4.4: il ranking privilegia robustezza annuale e plateau "
         "di configurazioni vicine, non il massimo di expectancy. La tabella full-period "
         "resta IN-SAMPLE; il dato decisivo continua a essere l'OUT-OF-SAMPLE Walk-Forward. "
         "Se l'OOS non resta positivo, la strategia non è robusta anche se il Robust Score è alto."
@@ -2499,7 +2638,7 @@ def render_optimizer_results(
         width="stretch",
         help=(
             "Contiene tutte le 576 configurazioni, i fold Walk-Forward, "
-            "i parametri scelti, la stabilità e tutti i trade OUT-OF-SAMPLE."
+            "i parametri scelti, la stabilità, il Cost Stress e tutti i trade OUT-OF-SAMPLE."
         ),
     )
     st.caption(
@@ -2686,7 +2825,7 @@ with st.sidebar:
 
     run_backtest = st.button("Esegui backtest", type="secondary", width="stretch")
     st.caption(
-        "Motore V4.3 robust/plateau: storici, ATR, stagionalità ed EMA SPX "
+        "Motore V4.4 robust/plateau + cost stress: storici, ATR, stagionalità ed EMA SPX "
         "vengono precalcolati e riutilizzati durante il backtest."
     )
 
