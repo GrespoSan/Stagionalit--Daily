@@ -2109,6 +2109,7 @@ def run_optimizer_walkforward(
     min_train_trades: int,
     min_train_pf: float,
     min_positive_year_ratio: float,
+    structure_mode: str = "AUTO",
 ) -> tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame, pd.DataFrame, list]:
     """
     V4.5 EDGE SEARCH.
@@ -2141,12 +2142,19 @@ def run_optimizer_walkforward(
     pool_cache = {}
     selected_cache = {}
 
+    if structure_mode == "SOLO OFF":
+        active_trend_modes = ["OFF"]
+    elif structure_mode == "SOLO CANDELA T-1":
+        active_trend_modes = ["CANDELA T-1 ALIGN"]
+    else:
+        active_trend_modes = list(OPT_TREND_MODES)
+
     signal_configs = [
         (th, atr, strength, trend_mode, direction_mode)
         for th in OPT_THRESHOLDS
         for atr in OPT_ATR_PERIODS
         for strength in OPT_STRENGTHS
-        for trend_mode in OPT_TREND_MODES
+        for trend_mode in active_trend_modes
         for direction_mode in OPT_DIRECTION_MODES
     ]
 
@@ -2518,7 +2526,7 @@ def build_optimizer_excel_report(
             ["Anni OOS totali", oos["years"]],
             ["% anni OOS positivi", oos["positive_year_ratio"]],
             ["Costo break-even per trade (R)", break_even_cost_r],
-            ["V4.7.1 EDGE FORTE", "PASS" if edge_v["pass"] else "FAIL"],
+            ["V4.8 EDGE FORTE", "PASS" if edge_v["pass"] else "FAIL"],
             ["OOS Totale R / Max DD", edge_v["rdd"]],
         ],
         columns=["Metrica", "Valore"],
@@ -2725,12 +2733,11 @@ def render_optimizer_results(
 ):
     st.header("⚙️ Ottimizzatore automatico + Walk-Forward")
 
+    mode_label = settings.get("Test strutturale", "AUTO")
+    config_count = settings.get("Numero configurazioni", "n/d")
     st.caption(
-        "V4.7 Edge Search Slim: 4 filtri stagionali × 6 ATR × 4 Forza × 6 Stop × "
-        "2 modalità = **1152 configurazioni**. "
-        "Modalità = OFF oppure CANDELA T-1 ALIGN. Direzione fissata LONG+SHORT. "
-        "Direzione = LONG+SHORT oppure SOLO LONG. "
-        "L'Asset Gate viene appreso esclusivamente sul training del fold."
+        f"V4.8 A/B Test · modalità **{mode_label}** · **{config_count} configurazioni**. "
+        "Direzione fissata LONG+SHORT. Asset Gate appreso esclusivamente sul training."
     )
 
     if full_df.empty:
@@ -2847,7 +2854,7 @@ def render_optimizer_results(
         )
 
     # ---------------- Verdetto Edge ----------------
-    st.subheader("Verdetto statistico V4.7.1")
+    st.subheader("Verdetto statistico V4.8")
     edge_v = edge_strength_verdict(oos_trades)
 
     if edge_v["pass"]:
@@ -2947,7 +2954,7 @@ def render_optimizer_results(
         st.dataframe(stab, width="stretch", hide_index=True)
 
     st.info(
-        "Interpretazione V4.7.1: il ranking privilegia robustezza annuale e plateau "
+        "Interpretazione V4.8: il ranking privilegia robustezza annuale e plateau "
         "di configurazioni vicine, non il massimo di expectancy. La tabella full-period "
         "resta IN-SAMPLE; il dato decisivo continua a essere l'OUT-OF-SAMPLE Walk-Forward. "
         "Se l'OOS non resta positivo, la strategia non è robusta anche se il Robust Score è alto."
@@ -2964,11 +2971,12 @@ def render_optimizer_results(
 
     start_tag = str(settings.get("Data inizio", "start")).replace("/", "-")
     end_tag = str(settings.get("Data fine", "end")).replace("/", "-")
+    mode_tag = str(settings.get("Test strutturale", "AUTO")).replace(" ", "_")
 
     st.download_button(
         "📥 Scarica report ottimizzazione Excel",
         data=excel_bytes,
-        file_name=f"seasonality_optimizer_{start_tag}_{end_tag}.xlsx",
+        file_name=f"seasonality_optimizer_{start_tag}_{end_tag}_{mode_tag}.xlsx",
         mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
         type="primary",
         width="stretch",
@@ -3208,7 +3216,7 @@ with st.sidebar:
 
     run_backtest = st.button("Esegui backtest", type="secondary", width="stretch")
     st.caption(
-        "Motore V4.7.1 Edge Search Slim: storici, ATR, stagionalità ed EMA SPX "
+        "Motore V4.8 A/B Test: storici, ATR, stagionalità ed EMA SPX "
         "vengono precalcolati e riutilizzati durante il backtest."
     )
 
@@ -3256,17 +3264,26 @@ with st.sidebar:
         step=10,
     )
 
+    opt_structure_mode = st.selectbox(
+        "Test strutturale",
+        ["AUTO", "SOLO OFF", "SOLO CANDELA T-1"],
+        index=0,
+        help=(
+            "Per il confronto A/B usa prima SOLO OFF e poi SOLO CANDELA T-1, "
+            "senza cambiare nessun altro parametro."
+        ),
+    )
+
     run_optimizer = st.button(
         "Ottimizza + Walk-Forward",
         type="secondary",
         width="stretch",
     )
+    active_config_count = 1152 if opt_structure_mode == "AUTO" else 576
     st.caption(
-        "V4.7 Edge Search Slim: griglia base invariata + "
-        "OFF/CANDELA T-1 ALIGN. Direzione fissata LONG+SHORT. "
-        "Totale 1152 configurazioni. "
-        "L'Asset Gate elimina asset solo se deboli nel TRAINING, mai guardando l'OOS. "
-        "Fissi: 1 trade/giorno, copertura 60%, SPX OFF."
+        f"V4.8 A/B Test · modalità **{opt_structure_mode}** · "
+        f"{active_config_count} configurazioni. Direzione fissata LONG+SHORT. "
+        "Asset Gate solo TRAINING. Fissi: 1 trade/giorno, copertura 60%, SPX OFF."
     )
 
     st.divider()
@@ -3351,6 +3368,7 @@ if run_optimizer:
         f"Min trade train **{int(opt_min_train_trades)}** · "
         f"Min PF train **{opt_min_train_pf:.2f}** · "
         f"Min anni positivi **{opt_min_positive_years_pct}%** · "
+        f"Test strutturale **{opt_structure_mode}** · "
         f"Universo **{opt_universe_source}**"
     )
 
@@ -3362,6 +3380,7 @@ if run_optimizer:
         min_train_trades=int(opt_min_train_trades),
         min_train_pf=float(opt_min_train_pf),
         min_positive_year_ratio=opt_min_positive_years_pct / 100,
+        structure_mode=opt_structure_mode,
     )
 
     opt_export_settings = {
@@ -3381,10 +3400,15 @@ if run_optimizer:
         "ATR testati": "3, 5, 7, 10, 14, 20",
         "Forza testate": "MEDIO+, BUONO+, SOLO BUONO, SOLO FORTE",
         "Stop ATR testati": "0.30, 0.40, 0.50, 0.60, 0.75, 1.00",
-        "Modalità testate": "OFF, CANDELA T-1 ALIGN",
+        "Test strutturale": opt_structure_mode,
+        "Modalità testate": (
+            "OFF, CANDELA T-1 ALIGN" if opt_structure_mode == "AUTO"
+            else "OFF" if opt_structure_mode == "SOLO OFF"
+            else "CANDELA T-1 ALIGN"
+        ),
         "Direzione": "LONG+SHORT (fissa)",
         "Asset Gate": "TRAIN ROBUST ex-ante, min 6 trade / PF 1.05 / Exp > 0 / min 3 asset",
-        "Numero configurazioni": 1152,
+        "Numero configurazioni": 1152 if opt_structure_mode == "AUTO" else 576,
     }
 
     render_optimizer_results(

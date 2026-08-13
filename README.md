@@ -643,3 +643,18 @@ Nessuna modifica alla logica:
 - LONG+SHORT fisso
 - Asset Gate training-only
 - Candela T-1 nello screener settimanale
+
+
+## V4.8 — A/B Test
+
+Aggiunto selettore `Test strutturale`:
+- AUTO
+- SOLO OFF
+- SOLO CANDELA T-1
+
+Per il confronto richiesto eseguire due run con identici parametri:
+1. SOLO OFF
+2. SOLO CANDELA T-1
+
+Ogni run forzato testa 576 configurazioni. AUTO continua a testarne 1152.
+Il nome del file Excel esportato include la modalità.
