@@ -658,3 +658,32 @@ Per il confronto richiesto eseguire due run con identici parametri:
 
 Ogni run forzato testa 576 configurazioni. AUTO continua a testarne 1152.
 Il nome del file Excel esportato include la modalità.
+
+
+## V4.9 — Asset Robustness: COMPLETO vs SENZA DAX
+
+Aggiunto il selettore `Robustezza universo`:
+- `COMPLETO`
+- `SENZA DAX`
+
+`SENZA DAX` rimuove esclusivamente il DAX cash proxy (`^GDAXI`) prima che
+inizi il Walk-Forward. Il ranking giornaliero viene quindi rifatto correttamente
+sugli asset rimanenti: non si limita a sottrarre i trade DAX dal risultato.
+
+Questo NON è un nuovo parametro ottimizzato e NON serve a cercare il miglior
+sottoinsieme di asset. È un test controllato di dipendenza da un singolo mercato.
+
+Per il test richiesto:
+- periodo: 2010-01-01 → 2018-12-31
+- Test strutturale: SOLO CANDELA T-1
+- Min PF training: 1,05
+- stessi altri parametri del test precedente
+- eseguire `SENZA DAX`
+
+Le classi Forza restano tutte attive nell'optimizer:
+- MEDIO+
+- BUONO+
+- SOLO BUONO
+- SOLO FORTE
+
+L'optimizer le seleziona sul training; non è fissato a SOLO FORTE.

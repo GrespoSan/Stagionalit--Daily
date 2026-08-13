@@ -2526,7 +2526,7 @@ def build_optimizer_excel_report(
             ["Anni OOS totali", oos["years"]],
             ["% anni OOS positivi", oos["positive_year_ratio"]],
             ["Costo break-even per trade (R)", break_even_cost_r],
-            ["V4.8 EDGE FORTE", "PASS" if edge_v["pass"] else "FAIL"],
+            ["V4.9 EDGE FORTE", "PASS" if edge_v["pass"] else "FAIL"],
             ["OOS Totale R / Max DD", edge_v["rdd"]],
         ],
         columns=["Metrica", "Valore"],
@@ -2734,9 +2734,11 @@ def render_optimizer_results(
     st.header("⚙️ Ottimizzatore automatico + Walk-Forward")
 
     mode_label = settings.get("Test strutturale", "AUTO")
+    universe_label = settings.get("Robustezza universo", "COMPLETO")
     config_count = settings.get("Numero configurazioni", "n/d")
     st.caption(
-        f"V4.8 A/B Test · modalità **{mode_label}** · **{config_count} configurazioni**. "
+        f"V4.9 Asset Robustness · modalità **{mode_label}** · "
+        f"universo **{universe_label}** · **{config_count} configurazioni**. "
         "Direzione fissata LONG+SHORT. Asset Gate appreso esclusivamente sul training."
     )
 
@@ -2854,7 +2856,7 @@ def render_optimizer_results(
         )
 
     # ---------------- Verdetto Edge ----------------
-    st.subheader("Verdetto statistico V4.8")
+    st.subheader("Verdetto statistico V4.9")
     edge_v = edge_strength_verdict(oos_trades)
 
     if edge_v["pass"]:
@@ -2954,7 +2956,7 @@ def render_optimizer_results(
         st.dataframe(stab, width="stretch", hide_index=True)
 
     st.info(
-        "Interpretazione V4.8: il ranking privilegia robustezza annuale e plateau "
+        "Interpretazione V4.9: il ranking privilegia robustezza annuale e plateau "
         "di configurazioni vicine, non il massimo di expectancy. La tabella full-period "
         "resta IN-SAMPLE; il dato decisivo continua a essere l'OUT-OF-SAMPLE Walk-Forward. "
         "Se l'OOS non resta positivo, la strategia non è robusta anche se il Robust Score è alto."
@@ -2972,11 +2974,12 @@ def render_optimizer_results(
     start_tag = str(settings.get("Data inizio", "start")).replace("/", "-")
     end_tag = str(settings.get("Data fine", "end")).replace("/", "-")
     mode_tag = str(settings.get("Test strutturale", "AUTO")).replace(" ", "_")
+    universe_tag = str(settings.get("Robustezza universo", "COMPLETO")).replace(" ", "_")
 
     st.download_button(
         "📥 Scarica report ottimizzazione Excel",
         data=excel_bytes,
-        file_name=f"seasonality_optimizer_{start_tag}_{end_tag}_{mode_tag}.xlsx",
+        file_name=f"seasonality_optimizer_{start_tag}_{end_tag}_{mode_tag}_{universe_tag}.xlsx",
         mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
         type="primary",
         width="stretch",
@@ -2992,6 +2995,35 @@ def render_optimizer_results(
 
     if errors:
         st.warning("\\n".join(errors))
+
+
+
+def apply_asset_robustness_mode(universe: dict, mode: str) -> tuple[dict, list]:
+    """
+    Test controllato di dipendenza dall'universo.
+
+    COMPLETO  -> universo invariato.
+    SENZA DAX -> rimuove esclusivamente il DAX cash proxy (^GDAXI) o una voce
+                 che contenga chiaramente 'DAX' nel nome.
+
+    Non seleziona asset in base ai risultati OOS.
+    """
+    out = universe.copy()
+    removed = []
+
+    if mode != "SENZA DAX":
+        return out, removed
+
+    for name, ticker in list(out.items()):
+        name_upper = str(name).upper()
+        ticker_upper = str(ticker).upper()
+
+        if ticker_upper == "^GDAXI" or "DAX" in name_upper:
+            removed.append(f"{name} ({ticker})")
+            out.pop(name, None)
+
+    return out, removed
+
 
 
 def parse_universe_text(text: str) -> tuple[dict, list]:
@@ -3216,7 +3248,7 @@ with st.sidebar:
 
     run_backtest = st.button("Esegui backtest", type="secondary", width="stretch")
     st.caption(
-        "Motore V4.8 A/B Test: storici, ATR, stagionalità ed EMA SPX "
+        "Motore V4.9 Asset Robustness: storici, ATR, stagionalità ed EMA SPX "
         "vengono precalcolati e riutilizzati durante il backtest."
     )
 
@@ -3274,6 +3306,17 @@ with st.sidebar:
         ),
     )
 
+    opt_asset_robustness = st.selectbox(
+        "Robustezza universo",
+        ["COMPLETO", "SENZA DAX"],
+        index=0,
+        help=(
+            "SENZA DAX serve esclusivamente al test di dipendenza dal DAX. "
+            "Non è una nuova variabile dell'optimizer: l'universo viene modificato "
+            "prima del Walk-Forward e resta fisso per tutto il test."
+        ),
+    )
+
     run_optimizer = st.button(
         "Ottimizza + Walk-Forward",
         type="secondary",
@@ -3281,9 +3324,10 @@ with st.sidebar:
     )
     active_config_count = 1152 if opt_structure_mode == "AUTO" else 576
     st.caption(
-        f"V4.8 A/B Test · modalità **{opt_structure_mode}** · "
-        f"{active_config_count} configurazioni. Direzione fissata LONG+SHORT. "
-        "Asset Gate solo TRAINING. Fissi: 1 trade/giorno, copertura 60%, SPX OFF."
+        f"V4.9 Asset Robustness · modalità **{opt_structure_mode}** · "
+        f"universo **{opt_asset_robustness}** · {active_config_count} configurazioni. "
+        "Direzione fissata LONG+SHORT. Asset Gate solo TRAINING. "
+        "Fissi: 1 trade/giorno, copertura 60%, SPX OFF."
     )
 
     st.divider()
@@ -3358,9 +3402,19 @@ if run_optimizer:
         st.error("Righe universo non valide: " + " | ".join(opt_bad_rows))
         st.stop()
 
+    opt_universe, opt_removed_assets = apply_asset_robustness_mode(
+        opt_universe,
+        opt_asset_robustness,
+    )
+
     if not opt_universe:
         st.error("Nessun asset valido nell'universo selezionato.")
         st.stop()
+
+    if opt_removed_assets:
+        st.warning(
+            "Test robustezza: escluso esclusivamente " + " | ".join(opt_removed_assets)
+        )
 
     st.info(
         f"Ottimizzazione: **{opt_start} → {opt_end}** · "
@@ -3369,6 +3423,7 @@ if run_optimizer:
         f"Min PF train **{opt_min_train_pf:.2f}** · "
         f"Min anni positivi **{opt_min_positive_years_pct}%** · "
         f"Test strutturale **{opt_structure_mode}** · "
+        f"Robustezza universo **{opt_asset_robustness}** · "
         f"Universo **{opt_universe_source}**"
     )
 
@@ -3401,6 +3456,8 @@ if run_optimizer:
         "Forza testate": "MEDIO+, BUONO+, SOLO BUONO, SOLO FORTE",
         "Stop ATR testati": "0.30, 0.40, 0.50, 0.60, 0.75, 1.00",
         "Test strutturale": opt_structure_mode,
+        "Robustezza universo": opt_asset_robustness,
+        "Asset esclusi robustness": " | ".join(opt_removed_assets) if opt_removed_assets else "NESSUNO",
         "Modalità testate": (
             "OFF, CANDELA T-1 ALIGN" if opt_structure_mode == "AUTO"
             else "OFF" if opt_structure_mode == "SOLO OFF"
