@@ -455,3 +455,38 @@ Corretto il TypeError durante la creazione del file Excel:
 - gestione esplicita dei valori infiniti nel riepilogo OOS.
 
 La logica di scanner, backtest, ottimizzatore e Walk-Forward è invariata.
+
+
+## V4.3 — Robust / Plateau Optimizer
+
+La griglia resta invariata a 576 configurazioni. Cambia il criterio di scelta.
+
+Nuove metriche per ogni configurazione:
+- mediana R annuale
+- peggior anno
+- miglior anno
+- dispersione dei risultati annuali
+- numero di configurazioni vicine
+- % configurazioni vicine positive
+- expectancy mediana dei vicini
+- Profit Factor mediano dei vicini
+- Robust Score 0–100
+
+Un "vicino" è una configurazione distante un solo passo in una sola dimensione
+(filtro, ATR, Forza o Stop).
+
+Pesi Robust Score:
+- 20% quota anni positivi
+- 15% mediana annuale
+- 15% peggior anno
+- 15% quota vicini positivi
+- 10% expectancy mediana dei vicini
+- 10% Profit Factor
+- 5% numero trade
+- 5% drawdown basso
+- 5% dispersione annuale bassa
+
+Il Walk-Forward non seleziona più la massima expectancy del training:
+ordina prima per Robust Score e stabilità annuale/plateau.
+
+Il giudizio finale resta esclusivamente OUT-OF-SAMPLE.

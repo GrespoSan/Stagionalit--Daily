@@ -1617,42 +1617,37 @@ def optimizer_evaluate_stop(
 
 
 def optimizer_metrics(trades: pd.DataFrame) -> dict:
+    empty = {
+        "signals": 0,
+        "valid": 0,
+        "no_data": 0,
+        "wins": 0,
+        "losses": 0,
+        "win_rate": np.nan,
+        "profit_factor": np.nan,
+        "expectancy_r": np.nan,
+        "total_r": np.nan,
+        "max_dd_r": np.nan,
+        "positive_year_ratio": np.nan,
+        "positive_years": 0,
+        "years": 0,
+        "median_year_r": np.nan,
+        "worst_year_r": np.nan,
+        "best_year_r": np.nan,
+        "year_std_r": np.nan,
+    }
+
     if trades is None or trades.empty:
-        return {
-            "signals": 0,
-            "valid": 0,
-            "no_data": 0,
-            "wins": 0,
-            "losses": 0,
-            "win_rate": np.nan,
-            "profit_factor": np.nan,
-            "expectancy_r": np.nan,
-            "total_r": np.nan,
-            "max_dd_r": np.nan,
-            "positive_year_ratio": np.nan,
-            "positive_years": 0,
-            "years": 0,
-        }
+        return empty.copy()
 
     valid = trades.dropna(subset=["R"]).copy()
     no_data = int(trades["R"].isna().sum())
 
     if valid.empty:
-        return {
-            "signals": len(trades),
-            "valid": 0,
-            "no_data": no_data,
-            "wins": 0,
-            "losses": 0,
-            "win_rate": np.nan,
-            "profit_factor": np.nan,
-            "expectancy_r": np.nan,
-            "total_r": np.nan,
-            "max_dd_r": np.nan,
-            "positive_year_ratio": np.nan,
-            "positive_years": 0,
-            "years": 0,
-        }
+        out = empty.copy()
+        out["signals"] = len(trades)
+        out["no_data"] = no_data
+        return out
 
     valid = valid.sort_values(["Date", "Asset"]).copy()
     wins = int((valid["R"] > 0).sum())
@@ -1688,7 +1683,12 @@ def optimizer_metrics(trades: pd.DataFrame) -> dict:
         "positive_year_ratio": positive_years / years if years > 0 else np.nan,
         "positive_years": positive_years,
         "years": years,
+        "median_year_r": float(yearly_r.median()) if years > 0 else np.nan,
+        "worst_year_r": float(yearly_r.min()) if years > 0 else np.nan,
+        "best_year_r": float(yearly_r.max()) if years > 0 else np.nan,
+        "year_std_r": float(yearly_r.std(ddof=0)) if years > 0 else np.nan,
     }
+
 
 
 def optimizer_metric_row(
@@ -1723,6 +1723,10 @@ def optimizer_metric_row(
         "Anni +": m["positive_years"],
         "Anni": m["years"],
         "% anni +": m["positive_year_ratio"],
+        "Mediana anno R": m["median_year_r"],
+        "Peggior anno R": m["worst_year_r"],
+        "Miglior anno R": m["best_year_r"],
+        "Dispersione anni R": m["year_std_r"],
         "R/DD": (
             m["total_r"] / m["max_dd_r"]
             if not pd.isna(m["total_r"])
@@ -1732,6 +1736,162 @@ def optimizer_metric_row(
         ),
     }
     return row, trades
+
+
+
+def add_plateau_metrics(df: pd.DataFrame) -> pd.DataFrame:
+    """
+    Misura quanto una configurazione è circondata da configurazioni vicine
+    che restano profittevoli.
+
+    Vicino = un solo passo di griglia in UNA sola dimensione:
+    filtro, ATR, Forza oppure Stop.
+    """
+    if df is None or df.empty:
+        return df.copy()
+
+    out = df.copy().reset_index(drop=True)
+
+    th_vals = list(OPT_THRESHOLDS)
+    atr_vals = list(OPT_ATR_PERIODS)
+    strength_vals = list(OPT_STRENGTHS)
+    stop_vals = [round(float(v), 2) for v in OPT_STOPS]
+
+    key_to_idx = {}
+    for i, row in out.iterrows():
+        key = (
+            int(row["Filtro %"]),
+            int(row["ATR"]),
+            str(row["Forza"]),
+            round(float(row["Stop ATR"]), 2),
+        )
+        key_to_idx[key] = i
+
+    n_list = []
+    pos_list = []
+    med_exp_list = []
+    med_pf_list = []
+    med_worst_list = []
+
+    for _, row in out.iterrows():
+        key = (
+            int(row["Filtro %"]),
+            int(row["ATR"]),
+            str(row["Forza"]),
+            round(float(row["Stop ATR"]), 2),
+        )
+
+        positions = [
+            th_vals.index(key[0]),
+            atr_vals.index(key[1]),
+            strength_vals.index(key[2]),
+            stop_vals.index(key[3]),
+        ]
+        grids = [th_vals, atr_vals, strength_vals, stop_vals]
+
+        neighbor_indices = []
+        for dim in range(4):
+            for delta in (-1, 1):
+                p = positions[dim] + delta
+                if 0 <= p < len(grids[dim]):
+                    nk = list(key)
+                    nk[dim] = grids[dim][p]
+                    nk = tuple(nk)
+                    if nk in key_to_idx:
+                        neighbor_indices.append(key_to_idx[nk])
+
+        if not neighbor_indices:
+            n_list.append(0)
+            pos_list.append(np.nan)
+            med_exp_list.append(np.nan)
+            med_pf_list.append(np.nan)
+            med_worst_list.append(np.nan)
+            continue
+
+        ndf = out.loc[neighbor_indices]
+        positive = (
+            (pd.to_numeric(ndf["Expectancy R"], errors="coerce") > 0)
+            & (pd.to_numeric(ndf["Profit Factor"], errors="coerce") > 1)
+        )
+
+        n_list.append(len(ndf))
+        pos_list.append(float(positive.mean()))
+        med_exp_list.append(
+            float(pd.to_numeric(ndf["Expectancy R"], errors="coerce").median())
+        )
+        med_pf_list.append(
+            float(pd.to_numeric(ndf["Profit Factor"], errors="coerce").replace([np.inf, -np.inf], np.nan).median())
+        )
+        med_worst_list.append(
+            float(pd.to_numeric(ndf["Peggior anno R"], errors="coerce").median())
+        )
+
+    out["Vicini"] = n_list
+    out["% vicini positivi"] = pos_list
+    out["Exp vicini mediana"] = med_exp_list
+    out["PF vicini mediana"] = med_pf_list
+    out["Peggior anno vicini mediana"] = med_worst_list
+    return out
+
+
+def add_robust_score(df: pd.DataFrame) -> pd.DataFrame:
+    """
+    Score 0-100 orientato alla robustezza, non al massimo rendimento.
+
+    Pesi:
+    20% anni positivi
+    15% mediana annuale
+    15% peggior anno
+    15% quota vicini positivi
+    10% expectancy mediana dei vicini
+    10% Profit Factor
+     5% numero trade
+     5% drawdown basso
+     5% dispersione annuale bassa
+    """
+    if df is None or df.empty:
+        return df.copy()
+
+    out = df.copy()
+
+    def pct_rank(series, higher_is_better=True, cap=None):
+        s = pd.to_numeric(series, errors="coerce").replace([np.inf, -np.inf], np.nan)
+        if cap is not None:
+            s = s.clip(lower=cap[0], upper=cap[1])
+        if s.notna().sum() == 0:
+            return pd.Series(0.0, index=s.index)
+        ranked = s.rank(
+            pct=True,
+            method="average",
+            ascending=True if higher_is_better else False,
+        )
+        return ranked.fillna(0.0)
+
+    components = {
+        "years_pos": pct_rank(out["% anni +"], True),
+        "median_year": pct_rank(out["Mediana anno R"], True),
+        "worst_year": pct_rank(out["Peggior anno R"], True),
+        "neighbor_pos": pct_rank(out["% vicini positivi"], True),
+        "neighbor_exp": pct_rank(out["Exp vicini mediana"], True),
+        "pf": pct_rank(out["Profit Factor"], True, cap=(0, 3)),
+        "trades": pct_rank(out["Trade"], True),
+        "dd": pct_rank(out["Max DD R"], False),
+        "dispersion": pct_rank(out["Dispersione anni R"], False),
+    }
+
+    out["Robust Score"] = 100.0 * (
+        0.20 * components["years_pos"]
+        + 0.15 * components["median_year"]
+        + 0.15 * components["worst_year"]
+        + 0.15 * components["neighbor_pos"]
+        + 0.10 * components["neighbor_exp"]
+        + 0.10 * components["pf"]
+        + 0.05 * components["trades"]
+        + 0.05 * components["dd"]
+        + 0.05 * components["dispersion"]
+    )
+
+    return out
 
 
 def run_optimizer_walkforward(
@@ -1809,6 +1969,8 @@ def run_optimizer_walkforward(
                 progress.progress(0.25 + 0.25 * count / total_full)
 
     full_df = pd.DataFrame(full_rows)
+    full_df = add_plateau_metrics(full_df)
+    full_df = add_robust_score(full_df)
 
     # Walk-forward rolling per anno.
     start_year = start_date.year
@@ -1853,41 +2015,52 @@ def run_optimizer_walkforward(
                 train_candidates.append(row)
 
         train_df = pd.DataFrame(train_candidates)
+        train_df = add_plateau_metrics(train_df)
+        train_df = add_robust_score(train_df)
 
         eligible = train_df[
             (train_df["Trade"] >= int(min_train_trades))
             & (train_df["Profit Factor"] >= float(min_train_pf))
             & (train_df["Expectancy R"] > 0)
             & (train_df["% anni +"] >= float(min_positive_year_ratio))
+            & (train_df["Vicini"] >= 3)
         ].copy()
 
-        selection_rule = "criteri completi"
+        selection_rule = "ROBUST: criteri completi + plateau"
 
-        # Fallback trasparente se nessuna configurazione supera tutti i criteri.
+        # Fallback trasparente: resta robust-oriented, ma allenta i filtri.
         if eligible.empty:
             eligible = train_df[
                 (train_df["Trade"] >= int(min_train_trades))
                 & (train_df["Expectancy R"] > 0)
+                & (train_df["Vicini"] >= 3)
             ].copy()
-            selection_rule = "fallback: trade minimi + expectancy positiva"
+            selection_rule = "ROBUST fallback: trade minimi + expectancy positiva"
 
         if eligible.empty:
             eligible = train_df[
-                train_df["Trade"] >= max(10, int(min_train_trades // 2))
+                (train_df["Trade"] >= max(10, int(min_train_trades // 2)))
+                & (train_df["Vicini"] >= 2)
             ].copy()
-            selection_rule = "fallback: campione minimo ridotto"
+            selection_rule = "ROBUST fallback: campione minimo ridotto"
 
         if eligible.empty:
             continue
 
-        # Ranking trasparente:
-        # 1 expectancy
-        # 2 PF
-        # 3 DD più basso
-        # 4 più trade
+        # La scelta NON è più il massimo di expectancy.
+        # Prima Robust Score, poi stabilità annuale e solo dopo performance.
         eligible = eligible.sort_values(
-            ["Expectancy R", "Profit Factor", "Max DD R", "Trade"],
-            ascending=[False, False, True, False],
+            [
+                "Robust Score",
+                "% anni +",
+                "Peggior anno R",
+                "Mediana anno R",
+                "% vicini positivi",
+                "Profit Factor",
+                "Max DD R",
+                "Trade",
+            ],
+            ascending=[False, False, False, False, False, False, True, False],
         )
 
         best = eligible.iloc[0]
@@ -1922,11 +2095,17 @@ def run_optimizer_walkforward(
             "Forza": key[2],
             "Stop ATR": stop,
             "Regola selezione": selection_rule,
+            "Robust Score": best["Robust Score"],
             "Train Trade": int(best["Trade"]),
             "Train PF": best["Profit Factor"],
             "Train Exp R": best["Expectancy R"],
             "Train DD R": best["Max DD R"],
             "Train % anni +": best["% anni +"],
+            "Train Mediana anno R": best["Mediana anno R"],
+            "Train Peggior anno R": best["Peggior anno R"],
+            "Train Dispersione anni R": best["Dispersione anni R"],
+            "Train % vicini positivi": best["% vicini positivi"],
+            "Train Exp vicini mediana": best["Exp vicini mediana"],
             "Test Trade": int(test_row["Trade"]),
             "Test NO DATI": int(test_row["NO DATI"]),
             "Test Win Rate": test_row["Win Rate"],
@@ -1941,6 +2120,10 @@ def run_optimizer_walkforward(
             "ATR": key[1],
             "Forza": key[2],
             "Stop ATR": stop,
+            "Robust Score": best["Robust Score"],
+            "% vicini positivi": best["% vicini positivi"],
+            "Mediana anno R": best["Mediana anno R"],
+            "Peggior anno R": best["Peggior anno R"],
         })
 
         progress.progress(0.50 + 0.50 * fold_i / total_folds)
@@ -2071,6 +2254,7 @@ def build_optimizer_excel_report(
                     "Win Rate" in col_name
                     or "% anni" in col_name
                     or "% fold" in col_name
+                    or "% vicini" in col_name
                 ):
                     cell_fmt = pct_fmt
                     width = max(width, 14)
@@ -2093,6 +2277,13 @@ def build_optimizer_excel_report(
                         "Test PF",
                         "Train DD",
                         "Test DD",
+                        "Mediana anno",
+                        "Peggior anno",
+                        "Miglior anno",
+                        "Dispersione anni",
+                        "Exp vicini",
+                        "PF vicini",
+                        "Robust Score",
                     ]
                 ):
                     cell_fmt = num2_fmt
@@ -2150,8 +2341,9 @@ def render_optimizer_results(
     # ---------------- Full period, solo esplorativo ----------------
     st.subheader("Top configurazioni full-period — esplorativo")
     st.warning(
-        "Questa tabella usa tutto il periodo e quindi è IN-SAMPLE. "
-        "Non va usata da sola per scegliere la strategia."
+        "Questa tabella usa tutto il periodo ed è IN-SAMPLE. "
+        "Ora è ordinata per Robust Score/plateau, non per expectancy massima, "
+        "ma non va comunque usata da sola per scegliere la strategia."
     )
 
     top = full_df[
@@ -2163,8 +2355,16 @@ def render_optimizer_results(
         top = full_df.copy()
 
     top = top.sort_values(
-        ["Expectancy R", "Profit Factor", "Max DD R", "Trade"],
-        ascending=[False, False, True, False],
+        [
+            "Robust Score",
+            "% anni +",
+            "Peggior anno R",
+            "% vicini positivi",
+            "Profit Factor",
+            "Max DD R",
+            "Trade",
+        ],
+        ascending=[False, False, False, False, False, True, False],
     ).head(20)
 
     top_disp = top.copy()
@@ -2174,7 +2374,18 @@ def render_optimizer_results(
     top_disp["% anni +"] = top_disp["% anni +"].map(
         lambda x: "n/d" if pd.isna(x) else f"{x:.0%}"
     )
-    for c in ["Profit Factor", "Expectancy R", "Totale R", "Max DD R", "R/DD"]:
+    if "% vicini positivi" in top_disp.columns:
+        top_disp["% vicini positivi"] = top_disp["% vicini positivi"].map(
+            lambda x: "n/d" if pd.isna(x) else f"{x:.0%}"
+        )
+    for c in [
+        "Profit Factor", "Expectancy R", "Totale R", "Max DD R", "R/DD",
+        "Mediana anno R", "Peggior anno R", "Miglior anno R",
+        "Dispersione anni R", "Exp vicini mediana", "PF vicini mediana",
+        "Peggior anno vicini mediana", "Robust Score"
+    ]:
+        if c not in top_disp.columns:
+            continue
         top_disp[c] = top_disp[c].map(
             lambda x: "n/d" if pd.isna(x) else ("∞" if np.isinf(x) else f"{x:.2f}")
         )
@@ -2189,11 +2400,17 @@ def render_optimizer_results(
         return
 
     fold_disp = folds_df.copy()
-    for c in ["Train PF", "Train Exp R", "Train DD R", "Test PF", "Test Exp R", "Test Tot R", "Test DD R"]:
-        fold_disp[c] = fold_disp[c].map(
-            lambda x: "n/d" if pd.isna(x) else ("∞" if np.isinf(x) else f"{x:.2f}")
-        )
-    for c in ["Train % anni +", "Test Win Rate"]:
+    for c in [
+        "Robust Score", "Train PF", "Train Exp R", "Train DD R",
+        "Train Mediana anno R", "Train Peggior anno R",
+        "Train Dispersione anni R", "Train Exp vicini mediana",
+        "Test PF", "Test Exp R", "Test Tot R", "Test DD R"
+    ]:
+        if c in fold_disp.columns:
+            fold_disp[c] = fold_disp[c].map(
+                lambda x: "n/d" if pd.isna(x) else ("∞" if np.isinf(x) else f"{x:.2f}")
+            )
+    for c in ["Train % anni +", "Train % vicini positivi", "Test Win Rate"]:
         fold_disp[c] = fold_disp[c].map(
             lambda x: "n/d" if pd.isna(x) else f"{x:.1%}"
         )
@@ -2255,10 +2472,10 @@ def render_optimizer_results(
         st.dataframe(stab, width="stretch", hide_index=True)
 
     st.info(
-        "Interpretazione: la tabella full-period serve solo a capire dove sono "
-        "le zone interessanti. Il dato decisivo è l'OUT-OF-SAMPLE Walk-Forward. "
-        "Se i parametri cambiano radicalmente a ogni fold o l'OOS non resta positivo, "
-        "l'ottimizzazione non è robusta."
+        "Interpretazione V4.3: il ranking privilegia robustezza annuale e plateau "
+        "di configurazioni vicine, non il massimo di expectancy. La tabella full-period "
+        "resta IN-SAMPLE; il dato decisivo continua a essere l'OUT-OF-SAMPLE Walk-Forward. "
+        "Se l'OOS non resta positivo, la strategia non è robusta anche se il Robust Score è alto."
     )
 
     st.subheader("Esporta risultati")
@@ -2469,7 +2686,7 @@ with st.sidebar:
 
     run_backtest = st.button("Esegui backtest", type="secondary", width="stretch")
     st.caption(
-        "Motore V4 ottimizzato: storici, ATR, stagionalità ed EMA SPX "
+        "Motore V4.3 robust/plateau: storici, ATR, stagionalità ed EMA SPX "
         "vengono precalcolati e riutilizzati durante il backtest."
     )
 
@@ -2523,8 +2740,9 @@ with st.sidebar:
         width="stretch",
     )
     st.caption(
-        "Griglia: filtro 65/70/75/80 · ATR 3/5/7/10/14/20 · "
+        "Griglia invariata: filtro 65/70/75/80 · ATR 3/5/7/10/14/20 · "
         "MEDIO+/BUONO+/SOLO BUONO/SOLO FORTE · Stop 0.30/0.40/0.50/0.60/0.75/1.00. "
+        "La V4.3 seleziona per robustezza annuale + plateau. "
         "Fissi: 1 trade/giorno, copertura 60%, SPX OFF."
     )
 
