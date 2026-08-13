@@ -599,3 +599,29 @@ La griglia diventa:
 = 3456 configurazioni.
 
 Asset Gate e criteri finali EDGE FORTE restano invariati.
+
+
+## V4.7 — Edge Search Slim + Candela T-1 nello screener
+
+Per ridurre carico e rischio di overfitting:
+- rimosso `EMA21 ALIGN`
+- rimossa la variabile `SOLO LONG`
+- direzione fissata `LONG+SHORT`
+- restano solo `OFF` e `CANDELA T-1 ALIGN`
+
+Griglia:
+4 threshold × 6 ATR × 4 Forza × 6 Stop × 2 modalità
+= 1152 configurazioni.
+
+L'Asset Gate training-only resta attivo.
+
+### Screener settimanale
+
+Aggiunta colonna `Candela T-1`:
+- `VERDE` se Close(T-1) > Open(T-1)
+- `ROSSA` se Close(T-1) < Open(T-1)
+- `DOJI` se Close(T-1) = Open(T-1)
+- `N/D` se non disponibile
+
+T-1 significa ultima vera seduta precedente alla data analizzata, non
+semplicemente il giorno di calendario precedente.
